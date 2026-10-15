@@ -18,6 +18,7 @@ endpoints, filters and payloads mirror that export.
 | `purchase_order_statuses` | no | `O,B` | `purchaseOrders` `OrderStatus` filter |
 | `stock_skip_inactive` | no | `false` | Skip stock calls for inactive products |
 | `stock_batch_size` | no | `100` | Products per `requestProductStock` call |
+| `unit4_product_stock_request_workers` | no | `5` | Concurrent `requestProductStock` requests (`1`–`32`) |
 | `page_size` / `max_pages` / `request_timeout` | no | `100` / `10000` / `300` | |
 
 URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
@@ -47,8 +48,11 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
 - **Retries:** 408, 429 and 5xx, 5 tries with exponential backoff; `Retry-After` honoured up to 120s.
 - **Pagination:** list endpoints use one-based `offset` values (`1`, `1 + limit`, ...); stops
   on a short, empty or 404 page. A repeated page or `max_pages` aborts the sync instead of looping.
-- **Stock:** active products are requested in batches of `stock_batch_size`; each response must
-  contain exactly one matching `productCode`/`unitCode` row per request or that batch aborts.
+- **Stock:** products are optionally filtered by `stock_skip_inactive`, then requested in
+  batches of `stock_batch_size`, with at most `unit4_product_stock_request_workers` HTTP
+  requests in flight. Only HTTP execution runs in worker threads; response parsing, identity
+  validation and Singer emission remain on the main thread. Each response must contain
+  exactly one matching `productCode`/`unitCode` row per request or that batch aborts.
 - **State:** `sell_orders` is unsorted, so the bookmark (max `orderDate`) is committed only when
   the stream completes. Each run re-reads from bookmark day minus lookback, so expect
   duplicates on `id`.

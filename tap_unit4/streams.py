@@ -10,6 +10,8 @@ Endpoints and filters mirror the Nestinox Alumio integration this tap replaces:
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import re
 import typing as t
 from datetime import date, datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from hotglue_singer_sdk.exceptions import FatalAPIError
 from tap_unit4.client import Unit4Stream
 
 STATUS_CODE = re.compile(r"^[A-Za-z0-9]{1,10}$")
+MAX_PRODUCT_STOCK_REQUEST_WORKERS = 32
 
 
 def nullable(*type_names: str) -> list[str]:
@@ -115,8 +118,8 @@ class ProductsStream(Unit4Stream):
 class ProductStockStream(Unit4Stream):
     """Available stock per product via POST /requestProductStock.
 
-    Products are requested in configurable batches so stock can run more often than
-    the full product sync without issuing one HTTP request per product.
+    Products are requested in configurable batches through a bounded HTTP request
+    pool so stock can run more often than the full product sync.
     """
 
     name = "product_stock"
@@ -153,6 +156,25 @@ class ProductStockStream(Unit4Stream):
         if size < 1:
             raise FatalAPIError("stock_batch_size must be a positive integer.")
         return size
+
+    @property
+    def stock_request_workers(self) -> int:
+        """Return the bounded number of concurrent Unit4 stock requests."""
+        config_key = "unit4_product_stock_request_workers"
+        raw_workers = self.config.get(config_key, 5)
+        error = (
+            f"{config_key} must be an integer between 1 and "
+            f"{MAX_PRODUCT_STOCK_REQUEST_WORKERS}."
+        )
+        if isinstance(raw_workers, bool):
+            raise FatalAPIError(error)
+        try:
+            workers = int(raw_workers)
+        except (TypeError, ValueError) as exc:
+            raise FatalAPIError(error) from exc
+        if not 1 <= workers <= MAX_PRODUCT_STOCK_REQUEST_WORKERS:
+            raise FatalAPIError(error)
+        return workers
 
     def prepare_request_payload(self, context, next_page_token) -> dict:
         return {
@@ -235,6 +257,7 @@ class ProductStockStream(Unit4Stream):
     def get_records(self, context) -> t.Iterable[dict]:
         skip_inactive = bool(self.config.get("stock_skip_inactive", False))
         batch_size = self.stock_batch_size
+        workers = self.stock_request_workers
         products = (
             {
                 "productCode": product["productCode"],
@@ -243,9 +266,36 @@ class ProductStockStream(Unit4Stream):
             for product in self._iter_products()
             if not (skip_inactive and product.get("inactive") is True)
         )
-        while batch := list(islice(products, batch_size)):
-            results = list(self.request_records({"products": batch}))
-            yield from self._validate_batch_results(batch, results)
+        decorated_request = self.request_decorator(self._request)
+        pending = deque()
+        products_exhausted = False
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            try:
+                while pending or not products_exhausted:
+                    while not products_exhausted and len(pending) < workers:
+                        batch = list(islice(products, batch_size))
+                        if not batch:
+                            products_exhausted = True
+                            break
+                        request_context = {"products": batch}
+                        prepared_request = self.prepare_request(request_context, None)
+                        future = executor.submit(
+                            decorated_request, prepared_request, None
+                        )
+                        pending.append((batch, prepared_request, future))
+
+                    if not pending:
+                        break
+
+                    batch, prepared_request, future = pending.popleft()
+                    response = future.result()
+                    self.update_sync_costs(prepared_request, response, None)
+                    results = list(self.parse_response(response))
+                    yield from self._validate_batch_results(batch, results)
+            finally:
+                for _, _, future in pending:
+                    future.cancel()
 
 
 class SellOrdersStream(Unit4Stream):

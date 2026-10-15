@@ -2,6 +2,7 @@
 
 import base64
 import json
+import threading
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -23,6 +24,7 @@ def config(**overrides):
         "username": "user",
         "password": "secret",
         "page_size": 2,
+        "unit4_product_stock_request_workers": 1,
         "start_date": "2026-09-10T00:00:00Z",
     }
     cfg.update(overrides)
@@ -308,6 +310,75 @@ class ProductStockTests(unittest.TestCase):
                 [len(request.json()["productIdentifiers"]) for request in posts],
                 [100, 1],
             )
+
+    def test_default_stock_request_workers_is_five(self):
+        cfg = config()
+        cfg.pop("unit4_product_stock_request_workers")
+        stream = TapUnit4(config=cfg).streams["product_stock"]
+        self.assertEqual(stream.stock_request_workers, 5)
+
+    def test_stock_request_workers_must_be_between_one_and_thirty_two(self):
+        for value in (0, 33):
+            with self.subTest(value=value):
+                stream = TapUnit4(
+                    config=config(unit4_product_stock_request_workers=value)
+                ).streams["product_stock"]
+                with self.assertRaises(FatalAPIError):
+                    _ = stream.stock_request_workers
+
+    def test_stock_requests_are_concurrent_but_parsed_on_main_thread(self):
+        stream = TapUnit4(
+            config=config(
+                stock_batch_size=1,
+                unit4_product_stock_request_workers=2,
+            )
+        ).streams["product_stock"]
+        products = [self._product("P1"), self._product("P2")]
+        main_thread = threading.get_ident()
+        second_request_started = threading.Event()
+        request_threads = set()
+        request_threads_lock = threading.Lock()
+        parse_threads = []
+
+        def send_request(prepared_request, _context):
+            with request_threads_lock:
+                request_threads.add(threading.get_ident())
+            payload = json.loads(prepared_request.body)
+            product_code = payload["productIdentifiers"][0]["productIdentifier"][
+                "productCode"
+            ]
+            if product_code == "P1":
+                self.assertTrue(second_request_started.wait(timeout=2))
+            else:
+                second_request_started.set()
+
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(
+                {"resultData": [self._stock(product_code)]}
+            ).encode()
+            response.request = prepared_request
+            return response
+
+        original_parse_response = stream.parse_response
+
+        def parse_response(response):
+            parse_threads.append(threading.get_ident())
+            yield from original_parse_response(response)
+
+        with patch.object(
+            stream, "_iter_products", return_value=iter(products)
+        ):
+            with patch.object(stream, "_request", side_effect=send_request):
+                with patch.object(
+                    stream, "parse_response", side_effect=parse_response
+                ):
+                    rows = records(stream)
+
+        self.assertEqual([row["productCode"] for row in rows], ["P1", "P2"])
+        self.assertEqual(len(request_threads), 2)
+        self.assertNotIn(main_thread, request_threads)
+        self.assertEqual(set(parse_threads), {main_thread})
 
     def test_configurable_batch_size(self):
         stream = TapUnit4(

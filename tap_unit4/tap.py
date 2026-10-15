@@ -90,6 +90,14 @@ class TapUnit4(Tap):
             default=100,
             description="Products per requestProductStock call.",
         ),
+        th.Property(
+            "unit4_product_stock_request_workers",
+            th.IntegerType,
+            default=5,
+            description=(
+                "Concurrent requestProductStock HTTP requests; allowed range 1-32."
+            ),
+        ),
         th.Property("page_size", th.IntegerType, default=100, description="limit per page."),
         th.Property(
             "max_pages",
