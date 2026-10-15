@@ -341,6 +341,23 @@ class SellOrderReplicationTests(unittest.TestCase):
         bookmark = tap.state["bookmarks"]["sell_orders"]
         self.assertEqual(bookmark["replication_key_value"], "2026-09-15T00:00:00")
 
+    def test_missing_or_invalid_order_date_is_fatal_without_bookmark(self):
+        for order in (
+            {"id": 1},
+            {"id": 1, "orderDate": None},
+            {"id": 1, "orderDate": ""},
+            {"id": 1, "orderDate": "not-a-date"},
+        ):
+            with self.subTest(order=order):
+                tap = TapUnit4(config=config())
+                stream = tap.streams["sell_orders"]
+                with requests_mock.Mocker() as m, patch("singer.write_message"):
+                    m.get(f"{BASE}/salesOrders", json=[order])
+                    with self.assertRaises(FatalAPIError):
+                        stream.sync()
+                bookmark = tap.state.get("bookmarks", {}).get("sell_orders", {})
+                self.assertNotIn("replication_key_value", bookmark)
+
     def test_failed_page_does_not_advance_bookmark(self):
         tap = TapUnit4(config=config())
         stream = tap.streams["sell_orders"]

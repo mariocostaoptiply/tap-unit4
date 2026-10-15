@@ -206,7 +206,7 @@ class SellOrdersStream(Unit4Stream):
         "properties": {
             "id": {"type": ["string", "integer"]},
             "orderCode": STRING,
-            "orderDate": STRING,
+            "orderDate": {"type": "string"},
             "status": STRING,
             "orderAmount": NUMBER,
             "lines": array_of(
@@ -220,8 +220,19 @@ class SellOrdersStream(Unit4Stream):
                 )
             ),
         },
-        "required": ["id"],
+        "required": ["id", "orderDate"],
     }
+
+    def post_process(self, row: dict, context=None) -> dict:
+        """Reject replication markers that cannot be resumed on the next run."""
+        marker = row.get("orderDate")
+        if not isinstance(marker, str) or not marker.strip():
+            raise FatalAPIError("Unit4 sell order is missing a valid orderDate.")
+        try:
+            _parse_day(marker)
+        except FatalAPIError as exc:
+            raise FatalAPIError("Unit4 sell order has an invalid orderDate.") from exc
+        return row
 
     @property
     def lookback_days(self) -> int:
