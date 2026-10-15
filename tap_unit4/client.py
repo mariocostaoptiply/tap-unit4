@@ -105,8 +105,10 @@ class Unit4Stream(RESTStream):
             raise FatalAPIError(
                 f"Unit4 403 Forbidden for {self.path}. Check the API user's permissions."
             )
-        if status in (204, 404):
-            # 404 is treated as an empty result (e.g. offset past the last page).
+        if status == 204:
+            return
+        if status == 404 and self.paginated and self._pages_fetched > 0:
+            # Unit4 may signal the end of offset pagination with a 404.
             return
         if status == 429:
             wait = self._retry_after_seconds(response)
@@ -141,8 +143,12 @@ class Unit4Stream(RESTStream):
 
     def _json(self, response: requests.Response) -> t.Any:
         """Decode JSON or fail loudly; a malformed page must not end a sync silently."""
-        if response.status_code in (204, 404) or not response.content:
+        if response.status_code in (204, 404):
             return []
+        if not response.content:
+            raise FatalAPIError(
+                f"Unit4 returned an empty response body for {self.path}."
+            )
         try:
             return response.json()
         except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as exc:

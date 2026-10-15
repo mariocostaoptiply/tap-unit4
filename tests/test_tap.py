@@ -86,10 +86,28 @@ class AuthAndErrorTests(unittest.TestCase):
                     records(self.stream)
                 self.assertEqual(m.call_count, 1)
 
-    def test_404_is_empty(self):
+    def test_first_page_404_is_fatal(self):
         with requests_mock.Mocker() as m:
             m.get(f"{BASE}/purchaseOrders", status_code=404)
-            self.assertEqual(records(self.stream), [])
+            with self.assertRaises(FatalAPIError):
+                records(self.stream)
+
+    def test_non_paginated_404_is_fatal(self):
+        stream = TapUnit4(config=config()).streams["product_stock"]
+        with requests_mock.Mocker() as m:
+            m.post(f"{BASE}/requestProductStock", status_code=404)
+            with self.assertRaises(FatalAPIError):
+                list(
+                    stream.request_records(
+                        {"productCode": "P1", "unitCode": "ST"}
+                    )
+                )
+
+    def test_empty_200_is_fatal(self):
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/purchaseOrders", status_code=200, content=b"")
+            with self.assertRaises(FatalAPIError):
+                records(self.stream)
 
     def test_malformed_json_is_fatal(self):
         with requests_mock.Mocker() as m:
