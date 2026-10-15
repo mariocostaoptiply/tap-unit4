@@ -17,6 +17,7 @@ endpoints, filters and payloads mirror that export.
 | `sell_order_statuses` | no | `A,Z,O` | `salesOrders` `status` filter |
 | `purchase_order_statuses` | no | `O,B` | `purchaseOrders` `OrderStatus` filter |
 | `stock_skip_inactive` | no | `false` | Skip stock calls for inactive products |
+| `stock_batch_size` | no | `100` | Products per `requestProductStock` call |
 | `page_size` / `max_pages` / `request_timeout` | no | `100` / `10000` / `300` | |
 
 URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
@@ -26,7 +27,7 @@ URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
 | Stream | Endpoint | Key | Replication |
 |---|---|---|---|
 | `products` | `GET /products?select=productClassification` | `productCode`, `unitCode` | FULL_TABLE |
-| `product_stock` | `POST /requestProductStock`, one call per product | `productCode`, `unitCode`, `resultIndex` | FULL_TABLE |
+| `product_stock` | `POST /requestProductStock`, up to `stock_batch_size` products per call | `productCode`, `unitCode`, `resultIndex` | FULL_TABLE |
 | `sell_orders` | `GET /salesOrders?filter=orderDate gt <day> and status in (...)&select=lines` | `id` | INCREMENTAL on `orderDate` |
 | `purchase_orders` | `GET /purchaseOrders?filter=OrderStatus in (...)&select=lines,supplierInfo` | `id` | FULL_TABLE (open-order snapshot) |
 
@@ -35,8 +36,10 @@ Optiply `skuCode` is `<productCode>-<unitCode>`; sell-order lines join to produc
 and read stock from `resultData[0].availableStockForSales`.
 
 Business rules Alumio applied in transformers are **not** in the tap and belong in the ETL:
-product-group filter (`10A`–`50E`), not-being-bought from groups `30C`/`40D`, minimum purchase
-quantity floor of 1, and status/discontinued mapping.
+accepted product groups (`10A`, `20B`, `30C`, `40D`, `50E`), `manualServiceLevel = 0`
+for groups `30C`/`40D`, minimum purchase and lot-size floors of `1`, price conversion,
+status/discontinued mapping, target upserts, supplier products, and sell-order line resolution.
+See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
 
 ## Behaviour
 
@@ -44,6 +47,8 @@ quantity floor of 1, and status/discontinued mapping.
 - **Retries:** 408, 429 and 5xx, 5 tries with exponential backoff; `Retry-After` honoured up to 120s.
 - **Pagination:** list endpoints use one-based `offset` values (`1`, `1 + limit`, ...); stops
   on a short, empty or 404 page. A repeated page or `max_pages` aborts the sync instead of looping.
+- **Stock:** active products are requested in batches of `stock_batch_size`; each response must
+  contain exactly one matching `productCode`/`unitCode` row per request or that batch aborts.
 - **State:** `sell_orders` is unsorted, so the bookmark (max `orderDate`) is committed only when
   the stream completes. Each run re-reads from bookmark day minus lookback, so expect
   duplicates on `id`.

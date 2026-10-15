@@ -84,6 +84,12 @@ class TapUnit4(Tap):
             default=False,
             description="Skip stock calls for products flagged inactive.",
         ),
+        th.Property(
+            "stock_batch_size",
+            th.IntegerType,
+            default=100,
+            description="Products per requestProductStock call.",
+        ),
         th.Property("page_size", th.IntegerType, default=100, description="limit per page."),
         th.Property(
             "max_pages",

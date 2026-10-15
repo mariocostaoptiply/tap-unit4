@@ -3,7 +3,7 @@
 Endpoints and filters mirror the Nestinox Alumio integration this tap replaces:
 
   products         GET  /products?select=productClassification          FULL_TABLE
-  product_stock    POST /requestProductStock (one call per product)     FULL_TABLE
+  product_stock    POST /requestProductStock (batched products)         FULL_TABLE
   sell_orders      GET  /salesOrders?filter=orderDate gt ... &select=lines  INCREMENTAL (orderDate)
   purchase_orders  GET  /purchaseOrders?filter=OrderStatus in (...)&select=lines,supplierInfo  FULL_TABLE
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import typing as t
 from datetime import date, datetime, timedelta, timezone
+from itertools import islice
 
 from hotglue_singer_sdk.exceptions import FatalAPIError
 
@@ -114,9 +115,8 @@ class ProductsStream(Unit4Stream):
 class ProductStockStream(Unit4Stream):
     """Available stock per product via POST /requestProductStock.
 
-    Unit4 has no bulk stock list in the Alumio contract, so this lists products and
-    asks for stock one product at a time (as Alumio did). It is a standalone stream
-    so HotGlue can schedule stock more often than the full product sync.
+    Products are requested in configurable batches so stock can run more often than
+    the full product sync without issuing one HTTP request per product.
     """
 
     name = "product_stock"
@@ -138,14 +138,31 @@ class ProductStockStream(Unit4Stream):
         "required": ["productCode", "unitCode", "resultIndex"],
     }
 
+    @property
+    def stock_batch_size(self) -> int:
+        """Return the configured number of products per stock request."""
+        raw_size = self.config.get("stock_batch_size", 100)
+        if isinstance(raw_size, bool):
+            raise FatalAPIError("stock_batch_size must be a positive integer.")
+        try:
+            size = int(raw_size)
+        except (TypeError, ValueError) as exc:
+            raise FatalAPIError(
+                "stock_batch_size must be a positive integer."
+            ) from exc
+        if size < 1:
+            raise FatalAPIError("stock_batch_size must be a positive integer.")
+        return size
+
     def prepare_request_payload(self, context, next_page_token) -> dict:
         return {
             "quantity": 1,
             "productIdentifiers": [
                 {
-                    "unitCode": context["unitCode"],
-                    "productIdentifier": {"productCode": context["productCode"]},
+                    "unitCode": product["unitCode"],
+                    "productIdentifier": {"productCode": product["productCode"]},
                 }
+                for product in context["products"]
             ],
             "propertiesToInclude": "*",
         }
@@ -167,6 +184,47 @@ class ProductStockStream(Unit4Stream):
             )
         yield from results
 
+    def _validate_batch_results(
+        self, products: list[dict], results: list[dict]
+    ) -> t.Iterable[dict]:
+        """Require exactly one correlated stock row per requested product."""
+        requested = [
+            (product["productCode"], product["unitCode"]) for product in products
+        ]
+        if len(set(requested)) != len(requested):
+            raise FatalAPIError(
+                f"Unit4 {self.path} request batch contains duplicate product identities."
+            )
+
+        returned = []
+        for result in results:
+            product_code = result.get("productCode")
+            unit_code = result.get("unitCode")
+            if (
+                not isinstance(product_code, str)
+                or not product_code
+                or not isinstance(unit_code, str)
+                or not unit_code
+            ):
+                raise FatalAPIError(
+                    f"Unit4 {self.path} result is missing string productCode/unitCode."
+                )
+            returned.append((product_code, unit_code))
+
+        if (
+            len(results) != len(products)
+            or len(set(returned)) != len(returned)
+            or set(returned) != set(requested)
+        ):
+            raise FatalAPIError(
+                f"Unit4 {self.path} result identities do not match the requested "
+                f"batch (requested={len(products)}, returned={len(results)}, "
+                f"unique={len(set(returned))})."
+            )
+
+        for result in results:
+            yield {**result, "resultIndex": 0}
+
     def _iter_products(self) -> t.Iterable[dict]:
         products = ProductsStream(tap=self._tap)
         for row in products.request_records(context=None):
@@ -176,15 +234,18 @@ class ProductStockStream(Unit4Stream):
 
     def get_records(self, context) -> t.Iterable[dict]:
         skip_inactive = bool(self.config.get("stock_skip_inactive", False))
-        for product in self._iter_products():
-            if skip_inactive and product.get("inactive") is True:
-                continue
-            product_context = {
+        batch_size = self.stock_batch_size
+        products = (
+            {
                 "productCode": product["productCode"],
                 "unitCode": product["unitCode"],
             }
-            for index, result in enumerate(self.request_records(product_context)):
-                yield {**result, **product_context, "resultIndex": index}
+            for product in self._iter_products()
+            if not (skip_inactive and product.get("inactive") is True)
+        )
+        while batch := list(islice(products, batch_size)):
+            results = list(self.request_records({"products": batch}))
+            yield from self._validate_batch_results(batch, results)
 
 
 class SellOrdersStream(Unit4Stream):

@@ -8,5 +8,6 @@
   "sell_order_lookback_days": 1,
   "sell_order_statuses": "A,Z,O",
   "purchase_order_statuses": "O,B",
+  "stock_batch_size": 100,
   "page_size": 100
 }

@@ -99,7 +99,11 @@ class AuthAndErrorTests(unittest.TestCase):
             with self.assertRaises(FatalAPIError):
                 list(
                     stream.request_records(
-                        {"productCode": "P1", "unitCode": "ST"}
+                        {
+                            "products": [
+                                {"productCode": "P1", "unitCode": "ST"}
+                            ]
+                        }
                     )
                 )
 
@@ -234,51 +238,136 @@ class PaginationTests(unittest.TestCase):
 
 
 class ProductStockTests(unittest.TestCase):
-    def test_one_post_per_product_with_alumio_payload(self):
-        stream = TapUnit4(config=config()).streams["product_stock"]
+    @staticmethod
+    def _product(code, inactive=False):
+        return {"productCode": code, "unitCode": "ST", "inactive": inactive}
+
+    @staticmethod
+    def _stock(code, quantity=1):
+        return {
+            "productCode": code,
+            "unitCode": "ST",
+            "availableStockForSales": quantity,
+        }
+
+    def test_batches_products_with_alumio_payload(self):
+        stream = TapUnit4(config=config(page_size=100)).streams["product_stock"]
+        products = [self._product("P1"), self._product("P2")]
         with requests_mock.Mocker() as m:
-            m.get(
-                f"{BASE}/products",
-                json=[{"productCode": "P1", "unitCode": "ST", "inactive": False}],
-            )
+            m.get(f"{BASE}/products", json=products)
             m.post(
                 f"{BASE}/requestProductStock",
-                json={"resultData": [{"availableStockForSales": 7}]},
+                json={"resultData": [self._stock("P1", 7), self._stock("P2", 8)]},
             )
             rows = records(stream)
+
             self.assertEqual(
                 rows,
                 [
-                    {
-                        "availableStockForSales": 7,
-                        "productCode": "P1",
-                        "unitCode": "ST",
-                        "resultIndex": 0,
-                    }
+                    {**self._stock("P1", 7), "resultIndex": 0},
+                    {**self._stock("P2", 8), "resultIndex": 0},
                 ],
             )
-            post = [r for r in m.request_history if r.method == "POST"][0]
+            posts = [request for request in m.request_history if request.method == "POST"]
+            self.assertEqual(len(posts), 1)
             self.assertEqual(
-                post.json(),
+                posts[0].json(),
                 {
                     "quantity": 1,
                     "productIdentifiers": [
-                        {"unitCode": "ST", "productIdentifier": {"productCode": "P1"}}
+                        {"unitCode": "ST", "productIdentifier": {"productCode": "P1"}},
+                        {"unitCode": "ST", "productIdentifier": {"productCode": "P2"}},
                     ],
                     "propertiesToInclude": "*",
                 },
             )
-            self.assertNotIn("offset", post.url)
+            self.assertNotIn("offset", posts[0].url)
 
-    def test_skip_inactive_and_empty_result(self):
-        stream = TapUnit4(config=config(stock_skip_inactive=True)).streams["product_stock"]
+    def test_default_batch_size_is_100(self):
+        stream = TapUnit4(config=config(page_size=200)).streams["product_stock"]
+        products = [self._product(f"P{index}") for index in range(101)]
         with requests_mock.Mocker() as m:
-            m.get(
-                f"{BASE}/products",
-                json=[
-                    {"productCode": "P1", "unitCode": "ST", "inactive": True},
+            m.get(f"{BASE}/products", json=products)
+            m.post(
+                f"{BASE}/requestProductStock",
+                [
+                    {
+                        "json": {
+                            "resultData": [
+                                self._stock(f"P{index}") for index in range(100)
+                            ]
+                        }
+                    },
+                    {"json": {"resultData": [self._stock("P100")]}},
                 ],
             )
+
+            self.assertEqual(len(records(stream)), 101)
+            posts = [request for request in m.request_history if request.method == "POST"]
+            self.assertEqual(
+                [len(request.json()["productIdentifiers"]) for request in posts],
+                [100, 1],
+            )
+
+    def test_configurable_batch_size(self):
+        stream = TapUnit4(
+            config=config(page_size=100, stock_batch_size=2)
+        ).streams["product_stock"]
+        products = [self._product("P1"), self._product("P2"), self._product("P3")]
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/products", json=products)
+            m.post(
+                f"{BASE}/requestProductStock",
+                [
+                    {"json": {"resultData": [self._stock("P1"), self._stock("P2")]}},
+                    {"json": {"resultData": [self._stock("P3")]}},
+                ],
+            )
+
+            self.assertEqual(len(records(stream)), 3)
+            posts = [request for request in m.request_history if request.method == "POST"]
+            self.assertEqual(
+                [len(request.json()["productIdentifiers"]) for request in posts],
+                [2, 1],
+            )
+
+    def test_invalid_batch_size_is_fatal(self):
+        for value in (0, -1):
+            with self.subTest(value=value):
+                stream = TapUnit4(
+                    config=config(stock_batch_size=value)
+                ).streams["product_stock"]
+                with self.assertRaises(FatalAPIError):
+                    records(stream)
+
+    def test_batch_identity_mismatch_is_fatal(self):
+        products = [self._product("P1"), self._product("P2")]
+        responses = (
+            [self._stock("P1")],
+            [self._stock("P1"), self._stock("P1")],
+            [self._stock("P1"), self._stock("P3")],
+            [{"availableStockForSales": 1}, self._stock("P2")],
+        )
+        for result_data in responses:
+            with self.subTest(result_data=result_data):
+                stream = TapUnit4(
+                    config=config(page_size=100)
+                ).streams["product_stock"]
+                with requests_mock.Mocker() as m:
+                    m.get(f"{BASE}/products", json=products)
+                    m.post(
+                        f"{BASE}/requestProductStock",
+                        json={"resultData": result_data},
+                    )
+                    with self.assertRaises(FatalAPIError):
+                        records(stream)
+
+    def test_skip_inactive_and_empty_result(self):
+        stream = TapUnit4(
+            config=config(stock_skip_inactive=True)
+        ).streams["product_stock"]
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/products", json=[self._product("P1", inactive=True)])
             m.post(f"{BASE}/requestProductStock", json={"resultData": []})
             self.assertEqual(records(stream), [])
             self.assertFalse(any(r.method == "POST" for r in m.request_history))
@@ -286,7 +375,7 @@ class ProductStockTests(unittest.TestCase):
     def test_unexpected_stock_shape_is_fatal(self):
         stream = TapUnit4(config=config()).streams["product_stock"]
         with requests_mock.Mocker() as m:
-            m.get(f"{BASE}/products", json=[{"productCode": "P1", "unitCode": "ST"}])
+            m.get(f"{BASE}/products", json=[self._product("P1")])
             m.post(f"{BASE}/requestProductStock", json={"resultData": {"x": 1}})
             with self.assertRaises(FatalAPIError):
                 records(stream)
@@ -294,10 +383,10 @@ class ProductStockTests(unittest.TestCase):
     def test_non_object_stock_result_is_fatal(self):
         stream = TapUnit4(config=config()).streams["product_stock"]
         with requests_mock.Mocker() as m:
-            m.get(f"{BASE}/products", json=[{"productCode": "P1", "unitCode": "ST"}])
+            m.get(f"{BASE}/products", json=[self._product("P1")])
             m.post(
                 f"{BASE}/requestProductStock",
-                json={"resultData": [{"availableStockForSales": 1}, 2]},
+                json={"resultData": [self._stock("P1"), 2]},
             )
             with self.assertRaises(FatalAPIError):
                 records(stream)
