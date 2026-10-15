@@ -175,11 +175,11 @@ class Unit4Stream(RESTStream):
         yield from super().request_records(context)
 
     def get_url_params(self, context, next_page_token) -> dict[str, t.Any]:
-        """Return query params; subclasses extend via extra_url_params()."""
+        """Return one-based pagination params plus endpoint-specific values."""
         params: dict[str, t.Any] = {}
         if self.paginated:
             params["limit"] = self.page_size
-            params["offset"] = next_page_token or 0
+            params["offset"] = 1 if next_page_token is None else next_page_token
         params.update(self.extra_url_params(context))
         return params
 
@@ -226,7 +226,7 @@ class Unit4Stream(RESTStream):
                 f"Unit4 {self.path} exceeded max_pages={self.max_pages}; aborting."
             )
 
-        return (previous_token or 0) + len(page)
+        return (1 if previous_token is None else previous_token) + len(page)
 
     def _write_state_message(self) -> None:
         """Write HotGlue-compatible state without partition noise."""

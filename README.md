@@ -42,8 +42,8 @@ quantity floor of 1, and status/discontinued mapping.
 
 - **Auth:** Basic. 401 raises `InvalidCredentialsError` without retry; 403 and other 4xx are fatal.
 - **Retries:** 408, 429 and 5xx, 5 tries with exponential backoff; `Retry-After` honoured up to 120s.
-- **Pagination:** `limit`/`offset`; stops on a short, empty or 404 page. A repeated page or
-  `max_pages` aborts the sync instead of looping.
+- **Pagination:** list endpoints use one-based `offset` values (`1`, `1 + limit`, ...); stops
+  on a short, empty or 404 page. A repeated page or `max_pages` aborts the sync instead of looping.
 - **State:** `sell_orders` is unsorted, so the bookmark (max `orderDate`) is committed only when
   the stream completes. Each run re-reads from bookmark day minus lookback, so expect
   duplicates on `id`.
@@ -51,10 +51,8 @@ quantity floor of 1, and status/discontinued mapping.
 
 ## Unverified against a live tenant
 
-There is no public Unit4 Wholesale API spec; these come from the Alumio config only:
+There is no public Unit4 Wholesale API spec; these remain unverified:
 
-- whether list endpoints accept `offset` (Alumio paged products/orders this way; purchase
-  orders were fetched in one `limit=5000` call);
 - the `orderDate` value format and whether results are ordered;
 - meanings of status codes `A/Z/O` and `O/B`;
 - whether `resultData` can contain more than one row per product (e.g. per warehouse);

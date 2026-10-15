@@ -165,7 +165,7 @@ class PaginationTests(unittest.TestCase):
     def _product(self, code):
         return {"productCode": code, "unitCode": "ST"}
 
-    def test_offset_pages_until_short_page(self):
+    def test_one_based_offset_pages_until_short_page(self):
         with requests_mock.Mocker() as m:
             m.get(
                 f"{BASE}/products",
@@ -177,7 +177,7 @@ class PaginationTests(unittest.TestCase):
             codes = [r["productCode"] for r in records(self.stream)]
             self.assertEqual(codes, ["A", "B", "C"])
             offsets = [query(r)["offset"] for r in m.request_history]
-            self.assertEqual(offsets, ["0", "2"])
+            self.assertEqual(offsets, ["1", "3"])
             self.assertEqual(query(m.request_history[0])["select"], "productClassification")
 
     def test_full_last_page_then_empty(self):
