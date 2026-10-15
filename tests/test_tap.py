@@ -121,6 +121,12 @@ class AuthAndErrorTests(unittest.TestCase):
             with self.assertRaises(FatalAPIError):
                 records(self.stream)
 
+    def test_non_object_list_item_is_fatal(self):
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/purchaseOrders", json=[{"id": 1}, 2])
+            with self.assertRaises(FatalAPIError):
+                records(self.stream)
+
     @patch("time.sleep", lambda *_: None)
     def test_5xx_retries_then_succeeds(self):
         with requests_mock.Mocker() as m:
@@ -282,6 +288,17 @@ class ProductStockTests(unittest.TestCase):
         with requests_mock.Mocker() as m:
             m.get(f"{BASE}/products", json=[{"productCode": "P1", "unitCode": "ST"}])
             m.post(f"{BASE}/requestProductStock", json={"resultData": {"x": 1}})
+            with self.assertRaises(FatalAPIError):
+                records(stream)
+
+    def test_non_object_stock_result_is_fatal(self):
+        stream = TapUnit4(config=config()).streams["product_stock"]
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/products", json=[{"productCode": "P1", "unitCode": "ST"}])
+            m.post(
+                f"{BASE}/requestProductStock",
+                json={"resultData": [{"availableStockForSales": 1}, 2]},
+            )
             with self.assertRaises(FatalAPIError):
                 records(stream)
 

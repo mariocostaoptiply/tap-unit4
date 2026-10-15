@@ -13,7 +13,6 @@ import requests
 import singer
 from hotglue_singer_sdk.authenticators import BasicAuthenticator
 from hotglue_singer_sdk.exceptions import FatalAPIError, RetriableAPIError
-from hotglue_singer_sdk.helpers.jsonpath import extract_jsonpath
 from hotglue_singer_sdk.streams import RESTStream
 from hotglue_singer_sdk.tap_base import InvalidCredentialsError
 from singer import StateMessage
@@ -156,16 +155,19 @@ class Unit4Stream(RESTStream):
                 f"Unit4 returned non-JSON for {self.path}: {response.text[:300]}"
             ) from exc
 
-    def parse_response(self, response: requests.Response) -> t.Iterable[dict]:
-        """Yield records from a top-level JSON array."""
+    def _list_records(self, response: requests.Response) -> list[dict]:
         payload = self._json(response)
-        if self.records_jsonpath == "$[*]" and not isinstance(payload, list):
+        if not isinstance(payload, list):
             raise FatalAPIError(
                 f"Unit4 {self.path} returned {type(payload).__name__}, expected a list."
             )
-        for record in extract_jsonpath(self.records_jsonpath, input=payload):
-            if isinstance(record, dict):
-                yield record
+        if any(not isinstance(record, dict) for record in payload):
+            raise FatalAPIError(f"Unit4 {self.path} returned a non-object list item.")
+        return payload
+
+    def parse_response(self, response: requests.Response) -> t.Iterable[dict]:
+        """Yield records from a top-level JSON array."""
+        yield from self._list_records(response)
 
     def request_records(self, context) -> t.Iterable[dict]:
         """Reset pagination guards for each independent paging run."""
@@ -205,7 +207,7 @@ class Unit4Stream(RESTStream):
         if not self.paginated or response.status_code in (204, 404):
             return None
 
-        page = [r for r in self._json(response) if isinstance(r, dict)]
+        page = self._list_records(response)
         if len(page) < self.page_size:
             return None
 

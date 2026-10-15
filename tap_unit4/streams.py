@@ -163,9 +163,11 @@ class ProductStockStream(Unit4Stream):
         results = payload.get("resultData") or []
         if not isinstance(results, list):
             raise FatalAPIError(f"Unit4 {self.path} resultData is not a list.")
-        for result in results:
-            if isinstance(result, dict):
-                yield result
+        if any(not isinstance(result, dict) for result in results):
+            raise FatalAPIError(
+                f"Unit4 {self.path} resultData contains a non-object item."
+            )
+        yield from results
 
     def _iter_products(self) -> t.Iterable[dict]:
         products = ProductsStream(tap=self._tap)
