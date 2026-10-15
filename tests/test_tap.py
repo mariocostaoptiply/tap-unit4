@@ -411,13 +411,61 @@ class ProductStockTests(unittest.TestCase):
                 with self.assertRaises(FatalAPIError):
                     records(stream)
 
+    def test_single_unidentified_stock_result_uses_only_missing_identity(self):
+        products = [self._product("P1"), self._product("P2")]
+        unidentified_results = (
+            {"availableStockForSales": 7},
+            {"productCode": "P1", "availableStockForSales": 7},
+            {"unitCode": "ST", "availableStockForSales": 7},
+        )
+        for unidentified in unidentified_results:
+            with self.subTest(unidentified=unidentified):
+                stream = TapUnit4(
+                    config=config(page_size=100)
+                ).streams["product_stock"]
+                with requests_mock.Mocker() as m:
+                    m.get(f"{BASE}/products", json=products)
+                    m.post(
+                        f"{BASE}/requestProductStock",
+                        json={
+                            "resultData": [
+                                unidentified,
+                                self._stock("P2", 8),
+                            ]
+                        },
+                    )
+
+                    self.assertEqual(
+                        records(stream),
+                        [
+                            {**self._stock("P1", 7), "resultIndex": 0},
+                            {**self._stock("P2", 8), "resultIndex": 0},
+                        ],
+                    )
+
     def test_batch_identity_mismatch_is_fatal(self):
         products = [self._product("P1"), self._product("P2")]
         responses = (
             [self._stock("P1")],
             [self._stock("P1"), self._stock("P1")],
             [self._stock("P1"), self._stock("P3")],
-            [{"availableStockForSales": 1}, self._stock("P2")],
+            [{"availableStockForSales": 1}, {"availableStockForSales": 2}],
+            [
+                {"productCode": "P3", "availableStockForSales": 1},
+                self._stock("P2"),
+            ],
+            [
+                {"unitCode": "EA", "availableStockForSales": 1},
+                self._stock("P2"),
+            ],
+            [
+                {"productCode": 1, "unitCode": "ST", "availableStockForSales": 1},
+                self._stock("P2"),
+            ],
+            [
+                {"productCode": "P1", "unitCode": 1, "availableStockForSales": 1},
+                self._stock("P2"),
+            ],
         )
         for result_data in responses:
             with self.subTest(result_data=result_data):

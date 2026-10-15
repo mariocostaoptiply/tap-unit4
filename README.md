@@ -51,8 +51,9 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
 - **Stock:** products are optionally filtered by `stock_skip_inactive`, then requested in
   batches of `stock_batch_size`, with at most `unit4_product_stock_request_workers` HTTP
   requests in flight. Only HTTP execution runs in worker threads; response parsing, identity
-  validation and Singer emission remain on the main thread. Each response must contain
-  exactly one matching `productCode`/`unitCode` row per request or that batch aborts.
+  validation and Singer emission remain on the main thread. Each response must map one row
+  to each requested identity. If exactly one row omits an identity, the tap fills the sole
+  unmatched request identity; ambiguous responses abort.
 - **State:** `sell_orders` is unsorted, so the bookmark (max `orderDate`) is committed only when
   the stream completes. Each run re-reads from bookmark day minus lookback, so expect
   duplicates on `id`.

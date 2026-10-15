@@ -219,30 +219,55 @@ class ProductStockStream(Unit4Stream):
             )
 
         returned = []
-        for result in results:
+        unidentified = []
+        for index, result in enumerate(results):
             product_code = result.get("productCode")
             unit_code = result.get("unitCode")
-            if (
-                not isinstance(product_code, str)
-                or not product_code
-                or not isinstance(unit_code, str)
-                or not unit_code
-            ):
+            if product_code not in (None, "") and not isinstance(product_code, str):
                 raise FatalAPIError(
-                    f"Unit4 {self.path} result is missing string productCode/unitCode."
+                    f"Unit4 {self.path} result has a non-string productCode."
                 )
-            returned.append((product_code, unit_code))
+            if unit_code not in (None, "") and not isinstance(unit_code, str):
+                raise FatalAPIError(
+                    f"Unit4 {self.path} result has a non-string unitCode."
+                )
+            if product_code and unit_code:
+                returned.append((product_code, unit_code))
+            else:
+                unidentified.append((index, product_code, unit_code))
 
+        requested_set = set(requested)
+        returned_set = set(returned)
+        missing = requested_set - returned_set
         if (
             len(results) != len(products)
-            or len(set(returned)) != len(returned)
-            or set(returned) != set(requested)
+            or len(returned_set) != len(returned)
+            or not returned_set.issubset(requested_set)
+            or len(unidentified) != len(missing)
+            or len(unidentified) > 1
         ):
             raise FatalAPIError(
                 f"Unit4 {self.path} result identities do not match the requested "
                 f"batch (requested={len(products)}, returned={len(results)}, "
-                f"unique={len(set(returned))})."
+                f"identified={len(returned_set)}, unidentified={len(unidentified)})."
             )
+
+        if unidentified:
+            index, product_code, unit_code = unidentified[0]
+            missing_product_code, missing_unit_code = missing.pop()
+            if (
+                product_code not in (None, "", missing_product_code)
+                or unit_code not in (None, "", missing_unit_code)
+            ):
+                raise FatalAPIError(
+                    f"Unit4 {self.path} unidentified result does not match the "
+                    "only missing request identity."
+                )
+            results[index] = {
+                **results[index],
+                "productCode": missing_product_code,
+                "unitCode": missing_unit_code,
+            }
 
         for result in results:
             yield {**result, "resultIndex": 0}

@@ -27,9 +27,10 @@ The current tap uses configurable paging rather than Alumio's fixed limits. Stoc
 use `stock_batch_size`, defaulting to `100`, and up to
 `unit4_product_stock_request_workers` concurrent HTTP requests, defaulting to `5`. Response
 parsing, identity validation and Singer emission remain single-threaded. Each response must
-contain exactly one matching `productCode`/`unitCode` result per requested product. Live
-request probes succeeded for batch sizes through `200`; the implemented concurrent Singer
-stock path still needs an end-to-end live run.
+map exactly one row to each requested product. A single result without an identity is
+correlated only when one requested identity remains unmatched; ambiguous responses abort.
+Live request probes succeeded for batch sizes through `200`; the implemented concurrent
+Singer stock path still needs an end-to-end live run.
 
 ## Product eligibility and mapping
 
