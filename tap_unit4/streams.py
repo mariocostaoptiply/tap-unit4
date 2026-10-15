@@ -26,7 +26,6 @@ def nullable(*type_names: str) -> list[str]:
     return [*type_names, "null"]
 
 
-ID_TYPE = {"type": nullable("string", "integer")}
 NUMBER = {"type": nullable("number")}
 STRING = {"type": nullable("string")}
 BOOLEAN = {"type": nullable("boolean")}
@@ -124,7 +123,6 @@ class ProductStockStream(Unit4Stream):
     path = "/requestProductStock"
     rest_method = "POST"
     paginated = False
-    records_jsonpath = "$.resultData[*]"
     primary_keys = ["productCode", "unitCode", "resultIndex"]
     replication_key = None
 

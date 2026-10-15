@@ -31,7 +31,6 @@ class Unit4Stream(RESTStream):
     List endpoints return a top-level JSON array and page with limit/offset.
     """
 
-    records_jsonpath = "$[*]"
     extra_retry_statuses = [408, 429]
 
     # Set on paginated streams. Used to fingerprint pages for loop detection.
