@@ -25,12 +25,12 @@ schedules is not present in the export.
 
 The current tap uses configurable paging rather than Alumio's fixed limits. Stock requests
 use `stock_batch_size`, defaulting to `100`, and up to
-`unit4_product_stock_request_workers` concurrent HTTP requests, defaulting to `5`. Response
-parsing, identity validation and Singer emission remain single-threaded. Each response must
-map exactly one row to each requested product. A single result without an identity is
-correlated only when one requested identity remains unmatched; ambiguous responses abort.
-Live request probes succeeded for batch sizes through `200`; the implemented concurrent
-Singer stock path still needs an end-to-end live run.
+`unit4_product_stock_request_workers` concurrent HTTP requests, defaulting to `10`. A live
+sequential probe returned one result per requested product with `productCode` nested under
+`productIdentifier` and `unitCode` at the top level. The tap flattens that nested product
+code and validates the complete identity set before emitting records. At most one missing
+identity may be inferred from the sole unmatched request; ambiguous responses abort. The
+probe returned `100` results for `100` products in `0.705` seconds.
 
 ## Product eligibility and mapping
 

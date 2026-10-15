@@ -252,22 +252,45 @@ class ProductStockTests(unittest.TestCase):
             "availableStockForSales": quantity,
         }
 
-    def test_batches_products_with_alumio_payload(self):
-        stream = TapUnit4(config=config(page_size=100)).streams["product_stock"]
+    @staticmethod
+    def _nested_stock(code, quantity=1):
+        return {
+            "productIdentifier": {"productCode": code},
+            "unitCode": "ST",
+            "availableStockForSales": quantity,
+        }
+
+    def test_batches_products_with_unit4_payload(self):
+        stream = TapUnit4(
+            config=config(page_size=100, stock_batch_size=2)
+        ).streams["product_stock"]
         products = [self._product("P1"), self._product("P2")]
         with requests_mock.Mocker() as m:
             m.get(f"{BASE}/products", json=products)
             m.post(
                 f"{BASE}/requestProductStock",
-                json={"resultData": [self._stock("P1", 7), self._stock("P2", 8)]},
+                json={
+                    "resultData": [
+                        self._nested_stock("P1", 7),
+                        self._nested_stock("P2", 8),
+                    ]
+                },
             )
             rows = records(stream)
 
             self.assertEqual(
                 rows,
                 [
-                    {**self._stock("P1", 7), "resultIndex": 0},
-                    {**self._stock("P2", 8), "resultIndex": 0},
+                    {
+                        **self._nested_stock("P1", 7),
+                        "productCode": "P1",
+                        "resultIndex": 0,
+                    },
+                    {
+                        **self._nested_stock("P2", 8),
+                        "productCode": "P2",
+                        "resultIndex": 0,
+                    },
                 ],
             )
             posts = [request for request in m.request_history if request.method == "POST"]
@@ -285,7 +308,7 @@ class ProductStockTests(unittest.TestCase):
             )
             self.assertNotIn("offset", posts[0].url)
 
-    def test_default_batch_size_is_100(self):
+    def test_default_batch_size_is_100_and_flattens_nested_identities(self):
         stream = TapUnit4(config=config(page_size=200)).streams["product_stock"]
         products = [self._product(f"P{index}") for index in range(101)]
         with requests_mock.Mocker() as m:
@@ -296,26 +319,31 @@ class ProductStockTests(unittest.TestCase):
                     {
                         "json": {
                             "resultData": [
-                                self._stock(f"P{index}") for index in range(100)
+                                self._nested_stock(f"P{index}")
+                                for index in range(100)
                             ]
                         }
                     },
-                    {"json": {"resultData": [self._stock("P100")]}},
+                    {"json": {"resultData": [self._nested_stock("P100")]}},
                 ],
             )
 
-            self.assertEqual(len(records(stream)), 101)
+            rows = records(stream)
+            self.assertEqual(
+                [row["productCode"] for row in rows],
+                [f"P{index}" for index in range(101)],
+            )
             posts = [request for request in m.request_history if request.method == "POST"]
             self.assertEqual(
                 [len(request.json()["productIdentifiers"]) for request in posts],
                 [100, 1],
             )
 
-    def test_default_stock_request_workers_is_five(self):
+    def test_default_stock_request_workers_is_ten(self):
         cfg = config()
         cfg.pop("unit4_product_stock_request_workers")
         stream = TapUnit4(config=cfg).streams["product_stock"]
-        self.assertEqual(stream.stock_request_workers, 5)
+        self.assertEqual(stream.stock_request_workers, 10)
 
     def test_stock_request_workers_must_be_between_one_and_thirty_two(self):
         for value in (0, 33):
@@ -355,7 +383,7 @@ class ProductStockTests(unittest.TestCase):
             response = requests.Response()
             response.status_code = 200
             response._content = json.dumps(
-                {"resultData": [self._stock(product_code)]}
+                {"resultData": [{"availableStockForSales": 1}]}
             ).encode()
             response.request = prepared_request
             return response
@@ -421,7 +449,7 @@ class ProductStockTests(unittest.TestCase):
         for unidentified in unidentified_results:
             with self.subTest(unidentified=unidentified):
                 stream = TapUnit4(
-                    config=config(page_size=100)
+                    config=config(page_size=100, stock_batch_size=2)
                 ).streams["product_stock"]
                 with requests_mock.Mocker() as m:
                     m.get(f"{BASE}/products", json=products)
@@ -466,11 +494,34 @@ class ProductStockTests(unittest.TestCase):
                 {"productCode": "P1", "unitCode": 1, "availableStockForSales": 1},
                 self._stock("P2"),
             ],
+            [
+                {
+                    **self._nested_stock("P1"),
+                    "productCode": "P3",
+                },
+                self._stock("P2"),
+            ],
+            [
+                {
+                    "productIdentifier": "P1",
+                    "unitCode": "ST",
+                    "availableStockForSales": 1,
+                },
+                self._stock("P2"),
+            ],
+            [
+                {
+                    "productIdentifier": {"productCode": 1},
+                    "unitCode": "ST",
+                    "availableStockForSales": 1,
+                },
+                self._stock("P2"),
+            ],
         )
         for result_data in responses:
             with self.subTest(result_data=result_data):
                 stream = TapUnit4(
-                    config=config(page_size=100)
+                    config=config(page_size=100, stock_batch_size=2)
                 ).streams["product_stock"]
                 with requests_mock.Mocker() as m:
                     m.get(f"{BASE}/products", json=products)

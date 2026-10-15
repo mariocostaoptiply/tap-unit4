@@ -88,12 +88,15 @@ class TapUnit4(Tap):
             "stock_batch_size",
             th.IntegerType,
             default=100,
-            description="Products per requestProductStock call.",
+            description=(
+                "Products per requestProductStock call; use more than 1 only when "
+                "response identities are guaranteed."
+            ),
         ),
         th.Property(
             "unit4_product_stock_request_workers",
             th.IntegerType,
-            default=5,
+            default=10,
             description=(
                 "Concurrent requestProductStock HTTP requests; allowed range 1-32."
             ),

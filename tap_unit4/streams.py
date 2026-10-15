@@ -161,7 +161,7 @@ class ProductStockStream(Unit4Stream):
     def stock_request_workers(self) -> int:
         """Return the bounded number of concurrent Unit4 stock requests."""
         config_key = "unit4_product_stock_request_workers"
-        raw_workers = self.config.get(config_key, 5)
+        raw_workers = self.config.get(config_key, 10)
         error = (
             f"{config_key} must be an integer between 1 and "
             f"{MAX_PRODUCT_STOCK_REQUEST_WORKERS}."
@@ -221,17 +221,43 @@ class ProductStockStream(Unit4Stream):
         returned = []
         unidentified = []
         for index, result in enumerate(results):
-            product_code = result.get("productCode")
-            unit_code = result.get("unitCode")
-            if product_code not in (None, "") and not isinstance(product_code, str):
+            top_level_product_code = result.get("productCode")
+            product_identifier = result.get("productIdentifier")
+            if product_identifier is not None and not isinstance(
+                product_identifier, dict
+            ):
                 raise FatalAPIError(
-                    f"Unit4 {self.path} result has a non-string productCode."
+                    f"Unit4 {self.path} result productIdentifier is not an object."
                 )
+            nested_product_code = (
+                product_identifier.get("productCode")
+                if isinstance(product_identifier, dict)
+                else None
+            )
+            for product_code in (top_level_product_code, nested_product_code):
+                if product_code not in (None, "") and not isinstance(
+                    product_code, str
+                ):
+                    raise FatalAPIError(
+                        f"Unit4 {self.path} result has a non-string productCode."
+                    )
+            if (
+                top_level_product_code
+                and nested_product_code
+                and top_level_product_code != nested_product_code
+            ):
+                raise FatalAPIError(
+                    f"Unit4 {self.path} result has conflicting product identities."
+                )
+
+            product_code = top_level_product_code or nested_product_code
+            unit_code = result.get("unitCode")
             if unit_code not in (None, "") and not isinstance(unit_code, str):
                 raise FatalAPIError(
                     f"Unit4 {self.path} result has a non-string unitCode."
                 )
             if product_code and unit_code:
+                results[index] = {**result, "productCode": product_code}
                 returned.append((product_code, unit_code))
             else:
                 unidentified.append((index, product_code, unit_code))

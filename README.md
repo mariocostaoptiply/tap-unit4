@@ -18,7 +18,7 @@ endpoints, filters and payloads mirror that export.
 | `purchase_order_statuses` | no | `O,B` | `purchaseOrders` `OrderStatus` filter |
 | `stock_skip_inactive` | no | `false` | Skip stock calls for inactive products |
 | `stock_batch_size` | no | `100` | Products per `requestProductStock` call |
-| `unit4_product_stock_request_workers` | no | `5` | Concurrent `requestProductStock` requests (`1`–`32`) |
+| `unit4_product_stock_request_workers` | no | `10` | Concurrent `requestProductStock` requests (`1`–`32`) |
 | `page_size` / `max_pages` / `request_timeout` | no | `100` / `10000` / `300` | |
 
 URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
@@ -50,10 +50,11 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
   on a short, empty or 404 page. A repeated page or `max_pages` aborts the sync instead of looping.
 - **Stock:** products are optionally filtered by `stock_skip_inactive`, then requested in
   batches of `stock_batch_size`, with at most `unit4_product_stock_request_workers` HTTP
-  requests in flight. Only HTTP execution runs in worker threads; response parsing, identity
-  validation and Singer emission remain on the main thread. Each response must map one row
-  to each requested identity. If exactly one row omits an identity, the tap fills the sole
-  unmatched request identity; ambiguous responses abort.
+  requests in flight. Unit4 returns `productCode` inside `productIdentifier`; the tap
+  flattens it, then validates each response identity before emitting records. At most one
+  omitted identity can be inferred from the sole unmatched request; ambiguous responses
+  abort. Only HTTP execution runs in worker threads; parsing, validation and Singer emission
+  remain on the main thread.
 - **State:** `sell_orders` is unsorted, so the bookmark (max `orderDate`) is committed only when
   the stream completes. Each run re-reads from bookmark day minus lookback, so expect
   duplicates on `id`.

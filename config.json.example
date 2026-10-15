@@ -9,6 +9,6 @@
   "sell_order_statuses": "A,Z,O",
   "purchase_order_statuses": "O,B",
   "stock_batch_size": 100,
-  "unit4_product_stock_request_workers": 5,
+  "unit4_product_stock_request_workers": 10,
   "page_size": 100
 }
