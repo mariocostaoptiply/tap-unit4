@@ -112,6 +112,10 @@ class ProductsStream(Unit4Stream):
             return None
         row["productCode"] = str(row["productCode"])
         row["unitCode"] = str(row["unitCode"])
+        if isinstance(row.get("eanCode"), int) and not isinstance(
+            row["eanCode"], bool
+        ):
+            row["eanCode"] = None if row["eanCode"] == 0 else str(row["eanCode"])
         return row
 
 

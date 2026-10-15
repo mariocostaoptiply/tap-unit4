@@ -238,6 +238,33 @@ class PaginationTests(unittest.TestCase):
             )
             self.assertEqual(records(self.stream), [])
 
+    def test_numeric_ean_codes_are_normalized(self):
+        with requests_mock.Mocker() as m:
+            m.get(
+                f"{BASE}/products",
+                [
+                    {
+                        "json": [
+                            {
+                                "productCode": "A",
+                                "unitCode": "ST",
+                                "eanCode": 0,
+                            },
+                            {
+                                "productCode": "B",
+                                "unitCode": "ST",
+                                "eanCode": 8712345678901,
+                            },
+                        ]
+                    },
+                    {"json": []},
+                ],
+            )
+
+            rows = records(self.stream)
+            self.assertIsNone(rows[0]["eanCode"])
+            self.assertEqual(rows[1]["eanCode"], "8712345678901")
+
 
 class ProductStockTests(unittest.TestCase):
     @staticmethod
