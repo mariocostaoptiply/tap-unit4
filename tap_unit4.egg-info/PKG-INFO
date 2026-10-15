@@ -5,7 +5,7 @@ Summary: Unit4 Wholesale tap for Optiply using hotglue_singer_sdk
 Author-email: Optiply <dev@optiply.com>
 Requires-Python: <3.11,>=3.9
 Requires-Dist: poetry-core
-Requires-Dist: hotglue-singer-sdk
+Requires-Dist: hotglue-singer-sdk==1.0.51
 Requires-Dist: backoff<2.0,>=1.8.0
 Requires-Dist: requests>=2.31.0
 Provides-Extra: test
