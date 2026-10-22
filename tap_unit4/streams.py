@@ -400,6 +400,12 @@ class SellOrdersStream(Unit4Stream):
             raise FatalAPIError("Unit4 sell order has an invalid orderDate.") from exc
         return row
 
+    def _increment_stream_state(self, latest_record: dict, *, context=None) -> None:
+        """Emit sentinel-dated orders without using them as replication markers."""
+        if _parse_day(latest_record["orderDate"]) == date.max:
+            return
+        super()._increment_stream_state(latest_record, context=context)
+
     @property
     def lookback_days(self) -> int:
         try:
@@ -417,6 +423,12 @@ class SellOrdersStream(Unit4Stream):
         marker = marker or self.config.get("start_date")
         if marker:
             start = _parse_day(marker)
+            if start == date.max:
+                raise FatalAPIError(
+                    "Unit4 sell_orders bookmark/start_date is the 9999-12-31 sentinel. "
+                    "Restore a last-good sales bookmark or clear only sell_orders state "
+                    "and configure a historical start_date."
+                )
         else:
             start = datetime.now(timezone.utc).date()
         # `gt` excludes the given day, so subtract one more to include the start day.

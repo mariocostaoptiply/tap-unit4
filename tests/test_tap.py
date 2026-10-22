@@ -644,6 +644,91 @@ class SellOrderReplicationTests(unittest.TestCase):
         bookmark = tap.state["bookmarks"]["sell_orders"]
         self.assertEqual(bookmark["replication_key_value"], "2026-09-15T00:00:00")
 
+    def test_sentinel_records_emit_without_poisoning_bookmark(self):
+        normal = {"id": 1, "orderDate": "2026-09-15T00:00:00", "lines": []}
+        for marker, sentinel_first in (
+            ("9999-12-31", False),
+            ("9999-12-31", True),
+            ("9999-12-31T00:00:00Z", True),
+        ):
+            with self.subTest(marker=marker, sentinel_first=sentinel_first):
+                sentinel = {"id": 2, "orderDate": marker, "lines": []}
+                orders = [sentinel, normal] if sentinel_first else [normal, sentinel]
+                tap = TapUnit4(config=config())
+                with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                    m.get(f"{BASE}/salesOrders", [{"json": orders}, {"json": []}])
+                    tap.streams["sell_orders"].sync()
+                emitted = [
+                    call.args[0].record
+                    for call in output.call_args_list
+                    if getattr(call.args[0], "record", None) is not None
+                ]
+                self.assertEqual(emitted, orders)
+                bookmark = tap.state["bookmarks"]["sell_orders"]
+                self.assertEqual(bookmark["replication_key_value"], normal["orderDate"])
+                resumed = TapUnit4(config=config(), state=tap.state)
+                with requests_mock.Mocker() as m, patch("singer.write_message"):
+                    m.get(f"{BASE}/salesOrders", json=[])
+                    resumed.streams["sell_orders"].sync()
+                    self.assertTrue(
+                        query(m.request_history[0])["filter"].startswith(
+                            "orderDate gt 2026-09-13 "
+                        )
+                    )
+
+    def test_sentinel_only_sync_preserves_bookmark(self):
+        for existing in (None, "2026-09-12"):
+            with self.subTest(existing=existing):
+                bookmark = {"replication_key": "orderDate"}
+                if existing is not None:
+                    bookmark["replication_key_value"] = existing
+                tap = TapUnit4(
+                    config=config(), state={"bookmarks": {"sell_orders": bookmark}}
+                )
+                order = {"id": 1, "orderDate": "9999-12-31", "lines": []}
+                with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                    m.get(f"{BASE}/salesOrders", json=[order])
+                    tap.streams["sell_orders"].sync()
+                emitted = [
+                    call.args[0].record
+                    for call in output.call_args_list
+                    if getattr(call.args[0], "record", None) is not None
+                ]
+                self.assertEqual(emitted, [order])
+                self.assertEqual(
+                    tap.state["bookmarks"]["sell_orders"].get("replication_key_value"),
+                    existing,
+                )
+
+    def test_poisoned_bookmark_fails_before_request(self):
+        for bookmark in (
+            "9999-12-31",
+            {"replication_key": "orderDate", "replication_key_value": "9999-12-31"},
+            {
+                "replication_key": "orderDate",
+                "replication_key_value": "9999-12-31T00:00:00Z",
+            },
+        ):
+            with self.subTest(bookmark=bookmark):
+                tap = TapUnit4(
+                    config=config(), state={"bookmarks": {"sell_orders": bookmark}}
+                )
+                with requests_mock.Mocker() as m, patch("singer.write_message"):
+                    with self.assertRaises(FatalAPIError):
+                        tap.streams["sell_orders"].sync()
+                    self.assertEqual(m.request_history, [])
+                self.assertTrue(
+                    tap.state["bookmarks"]["sell_orders"]["replication_key_value"]
+                    .startswith("9999-12-31")
+                )
+
+    def test_sentinel_start_date_fails_before_request(self):
+        tap = TapUnit4(config=config(start_date="9999-12-31"))
+        with requests_mock.Mocker() as m, patch("singer.write_message"):
+            with self.assertRaises(FatalAPIError):
+                tap.streams["sell_orders"].sync()
+            self.assertEqual(m.request_history, [])
+
     def test_missing_or_invalid_order_date_is_fatal_without_bookmark(self):
         for order in (
             {"id": 1},
@@ -662,18 +747,26 @@ class SellOrderReplicationTests(unittest.TestCase):
                 self.assertNotIn("replication_key_value", bookmark)
 
     def test_failed_page_does_not_advance_bookmark(self):
-        tap = TapUnit4(config=config())
-        stream = tap.streams["sell_orders"]
-        page = [
-            {"id": 1, "orderDate": "2026-09-30T00:00:00"},
-            {"id": 2, "orderDate": "2026-09-30T00:00:00"},
-        ]
-        with requests_mock.Mocker() as m, patch("singer.write_message"):
-            m.get(f"{BASE}/salesOrders", [{"json": page}, {"status_code": 400}])
-            with self.assertRaises(FatalAPIError):
-                stream.sync()
-        bookmark = tap.state.get("bookmarks", {}).get("sell_orders", {})
-        self.assertNotEqual(bookmark.get("replication_key_value"), "2026-09-30T00:00:00")
+        for existing in (None, "2026-09-20"):
+            with self.subTest(existing=existing):
+                bookmark = {"replication_key": "orderDate"}
+                if existing is not None:
+                    bookmark["replication_key_value"] = existing
+                tap = TapUnit4(
+                    config=config(), state={"bookmarks": {"sell_orders": bookmark}}
+                )
+                page = [
+                    {"id": 1, "orderDate": "2026-09-30T00:00:00"},
+                    {"id": 2, "orderDate": "9999-12-31"},
+                ]
+                with requests_mock.Mocker() as m, patch("singer.write_message"):
+                    m.get(f"{BASE}/salesOrders", [{"json": page}, {"status_code": 400}])
+                    with self.assertRaises(FatalAPIError):
+                        tap.streams["sell_orders"].sync()
+                self.assertEqual(
+                    tap.state["bookmarks"]["sell_orders"].get("replication_key_value"),
+                    existing,
+                )
 
 
 if __name__ == "__main__":

@@ -58,6 +58,12 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
 - **State:** `sell_orders` is unsorted, so the bookmark (max `orderDate`) is committed only when
   the stream completes. Each run re-reads from bookmark day minus lookback, so expect
   duplicates on `id`.
+  Orders dated `9999-12-31` (including timestamps on that day) are emitted unchanged
+  but excluded from bookmark advancement. A sentinel-only run keeps the existing
+  bookmark, or creates no bookmark on a first run. A saved sentinel bookmark or
+  sentinel `start_date` aborts before HTTP requests. To recover poisoned state,
+  restore the last-good sales bookmark, or clear only `sell_orders` state and set
+  a deliberate historical `start_date`; without either, the tap starts from today.
 - **Deletes:** not exposed by the Alumio contract.
 
 ## Unverified against a live tenant
