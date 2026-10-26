@@ -148,6 +148,14 @@ no writer for that storage. Before implementing purchase-order ETL behavior, est
 - the target key and close/delete semantics when an order leaves statuses `O/B`;
 - who writes and reads the Unit4-line-ID → Optiply-buy-order-ID mapping.
 
+The tap now extracts purchase orders in two phases: the complete filtered open-order
+scan, then individual lookups for previously tracked orders missing from that scan.
+Both emit the same `purchase_orders` records, including `lines` and `supplierInfo`.
+Header `orderStatus` values `T/Z` retire tap tracking after successful extraction;
+absence, missing detail responses and terminal line statuses do not imply completion.
+Buy-order completion and cumulative receipts from native line IDs and
+`quantityDelivered` remain ETL responsibilities, not tap transformations.
+
 ## Optiply-only maintenance flow
 
 Alumio also ran a job every 15 minutes that:

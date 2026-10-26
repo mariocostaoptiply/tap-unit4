@@ -30,7 +30,7 @@ URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
 | `products` | `GET /products?select=productClassification` | `productCode`, `unitCode` | FULL_TABLE |
 | `product_stock` | `POST /requestProductStock`, up to `stock_batch_size` products per call | `productCode`, `unitCode`, `resultIndex` | FULL_TABLE |
 | `sell_orders` | `GET /salesOrders?filter=orderDate gt <day> and status in (...)&select=lines` | `id` | INCREMENTAL on `orderDate` |
-| `purchase_orders` | `GET /purchaseOrders?filter=OrderStatus in (...)&select=lines,supplierInfo` | `id` | FULL_TABLE (open-order snapshot) |
+| `purchase_orders` | `GET /purchaseOrders?filter=OrderStatus in (...)&select=lines,supplierInfo`, then `GET /purchaseOrders/{id}?select=lines,supplierInfo` for missing tracked orders | `id` | FULL_TABLE plus tracked-order follow-up |
 
 Optiply `skuCode` is `<productCode>-<unitCode>`; sell-order lines join to products on
 `lines[].productIdentifier.productCode` + `lines[].unitCode`. Alumio divided `costPrice` by 100
@@ -64,6 +64,22 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
   sentinel `start_date` aborts before HTTP requests. To recover poisoned state,
   restore the last-good sales bookmark, or clear only `sell_orders` state and set
   a deliberate historical `start_date`; without either, the tap starts from today.
+- **Purchase orders:** finish the entire filtered, paginated scan first. Track observed
+  nonterminal order IDs, then fetch previously tracked IDs absent from that scan by ID,
+  without a status filter or pagination. Both phases emit the same `purchase_orders`
+  records with native IDs, `orderDate`, header status, supplier info and nested lines.
+  The tap does not derive receipts, change delivered quantities or close Optiply orders.
+- **Purchase state:** `bookmarks.purchase_orders` stores `tracked_order_ids` (strings)
+  and `source_scope` (the normalized Unit4 REST base URL, including environment and
+  administration). Only header `orderStatus` values `T` and `Z` retire tracking; terminal
+  line statuses alone do not. Other header statuses remain tracked. Tracking changes
+  are published only after every page, lookup and record emission succeeds.
+  Missing, malformed or mismatched detail responses fail the stream without retiring
+  IDs; a detail 404 is never interpreted as completion or end of pagination.
+  State from another source, or nonempty tracking without a source scope, fails before
+  requests. An empty initial state tracks currently observed orders only, not historical
+  closed orders. This flow relies on HotGlue promoting state only after end-to-end job
+  success; a failed ETL must resume from the previous successful job state.
 - **Deletes:** not exposed by the Alumio contract.
 
 ## Unverified against a live tenant
