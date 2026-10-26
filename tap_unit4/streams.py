@@ -1,11 +1,11 @@
 """Unit4 Wholesale stream definitions.
 
-Endpoints and filters mirror the Nestinox Alumio integration this tap replaces:
+Endpoints and filters follow the Nestinox Alumio integration, except purchase orders:
 
   products         GET  /products?select=productClassification          FULL_TABLE
   product_stock    POST /requestProductStock (batched products)         FULL_TABLE
   sell_orders      GET  /salesOrders?filter=orderDate gt ... &select=lines  INCREMENTAL (orderDate)
-  purchase_orders  GET  /purchaseOrders?filter=OrderStatus in (...)&select=lines,supplierInfo  FULL_TABLE
+  purchase_orders  GET  /purchaseOrders?select=lines,supplierInfo        FULL_TABLE
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import re
 import typing as t
 from datetime import date, datetime, timedelta, timezone
 from itertools import islice
-from urllib.parse import quote
 
 from hotglue_singer_sdk.exceptions import FatalAPIError
 
@@ -447,7 +446,7 @@ class SellOrdersStream(Unit4Stream):
 
 
 class PurchaseOrdersStream(Unit4Stream):
-    """Open purchase orders, followed by tracked orders missing from the open scan."""
+    """All Unit4 purchase orders with lines and supplier info on every run."""
 
     name = "purchase_orders"
     path = "/purchaseOrders"
@@ -469,85 +468,7 @@ class PurchaseOrdersStream(Unit4Stream):
     }
 
     def extra_url_params(self, context) -> dict[str, t.Any]:
-        return {
-            "filter": status_filter(
-                "OrderStatus", self.config.get("purchase_order_statuses"), "O,B"
-            ),
-            "select": "lines,supplierInfo",
-        }
-
-    @staticmethod
-    def _order_id(record: dict) -> str:
-        value = record.get("id")
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (str, int))
-            or not str(value).strip()
-        ):
-            raise FatalAPIError("Unit4 purchase order has a missing or invalid id.")
-        return str(value)
-
-    def _get_tracked_order(self, order_id: str, context) -> dict:
-        prepared_request = self.build_prepared_request(
-            method=self.rest_method,
-            url=f"{self.url_base}{self.path}/{quote(order_id, safe='')}",
-            params={"select": "lines,supplierInfo"},
-            headers=self.http_headers,
-        )
-        response = self.request_decorator(self._request)(prepared_request, context)
-        self.update_sync_costs(prepared_request, response, context)
-        # A detail 404 is not the end-of-pagination 404 accepted by the list scan.
-        if response.status_code != 200:
-            raise FatalAPIError(
-                f"Unit4 purchase order {order_id!r} lookup returned "
-                f"{response.status_code}; tracking is unchanged."
-            )
-        record = self._json(response)
-        if not isinstance(record, dict) or self._order_id(record) != order_id:
-            raise FatalAPIError(
-                f"Unit4 purchase order {order_id!r} lookup returned an invalid identity."
-            )
-        return record
-
-    def get_records(self, context) -> t.Iterable[dict]:
-        state = self.get_context_state(context)
-        source_scope = self.url_base
-        saved_ids = state.get("tracked_order_ids", [])
-        if not isinstance(saved_ids, list) or any(
-            not isinstance(order_id, str) or not order_id.strip()
-            for order_id in saved_ids
-        ):
-            raise FatalAPIError("Invalid purchase_orders tracked_order_ids state.")
-        if state.get("source_scope", source_scope) != source_scope or (
-            saved_ids and "source_scope" not in state
-        ):
-            raise FatalAPIError(
-                "purchase_orders state belongs to a different or unknown Unit4 source; "
-                "restore state for the configured source."
-            )
-        tracked_ids = set(saved_ids)
-        missing_ids = tracked_ids.copy()
-
-        for record in super().get_records(context):
-            order_id = self._order_id(record)
-            missing_ids.discard(order_id)
-            if record.get("orderStatus") in ("T", "Z"):
-                tracked_ids.discard(order_id)
-            else:
-                tracked_ids.add(order_id)
-            yield record
-
-        for order_id in sorted(missing_ids):
-            record = self._get_tracked_order(order_id, context)
-            if record.get("orderStatus") in ("T", "Z"):
-                tracked_ids.discard(order_id)
-            yield record
-
-        # Publish additions and retirements only after every record was consumed.
-        state.update(
-            source_scope=source_scope,
-            tracked_order_ids=sorted(tracked_ids),
-        )
+        return {"select": "lines,supplierInfo"}
 
 
 def _parse_day(value: t.Any) -> date:

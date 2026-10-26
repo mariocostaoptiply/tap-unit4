@@ -7,7 +7,6 @@
   "start_date": "2026-09-01T00:00:00Z",
   "sell_order_lookback_days": 1,
   "sell_order_statuses": "A,Z,O",
-  "purchase_order_statuses": "O,B",
   "stock_batch_size": 100,
   "unit4_product_stock_request_workers": 10,
   "page_size": 100

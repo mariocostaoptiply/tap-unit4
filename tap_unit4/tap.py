@@ -73,12 +73,6 @@ class TapUnit4(Tap):
             description="Comma-separated salesOrders status codes to include.",
         ),
         th.Property(
-            "purchase_order_statuses",
-            th.StringType,
-            default="O,B",
-            description="Comma-separated purchaseOrders OrderStatus codes to include.",
-        ),
-        th.Property(
             "stock_skip_inactive",
             th.BooleanType,
             default=False,

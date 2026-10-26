@@ -6,7 +6,7 @@ import threading
 import unittest
 from copy import deepcopy
 from unittest.mock import patch
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import requests_mock
@@ -71,8 +71,9 @@ class AuthAndErrorTests(unittest.TestCase):
             sent = m.request_history[0]
             expected = base64.b64encode(b"user:secret").decode()
             self.assertEqual(sent.headers["Authorization"], f"Basic {expected}")
-            self.assertIn("filter=OrderStatus%20in%20('O','B')", sent.url)
-            self.assertEqual(query(sent)["select"], "lines,supplierInfo")
+            self.assertEqual(
+                query(sent), {"limit": "2", "offset": "1", "select": "lines,supplierInfo"}
+            )
 
     def test_401_is_invalid_credentials_without_retry(self):
         with requests_mock.Mocker() as m:
@@ -590,7 +591,7 @@ class ProductStockTests(unittest.TestCase):
                 records(stream)
 
 
-class PurchaseOrderTrackingTests(unittest.TestCase):
+class PurchaseOrderFullSyncTests(unittest.TestCase):
     @staticmethod
     def _order(order_id="PO-1", status="O", delivered=2):
         return {
@@ -610,333 +611,87 @@ class PurchaseOrderTrackingTests(unittest.TestCase):
             ],
         }
 
-    @staticmethod
-    def _state(*order_ids):
-        return {
+    def test_all_statuses_are_emitted_across_unfiltered_pages(self):
+        orders = [
+            self._order("PO-1", "O"),
+            self._order("PO-2", "B"),
+            self._order("PO-3", "T"),
+            self._order("PO-4", "Z"),
+            self._order(37, "X"),
+        ]
+        stream = TapUnit4(config=config()).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
+            m.get(
+                f"{BASE}/purchaseOrders",
+                [{"json": orders[:2]}, {"json": orders[2:4]}, {"json": orders[4:]}],
+            )
+            self.assertEqual(records(stream), orders)
+            self.assertEqual(
+                [query(request) for request in m.request_history],
+                [
+                    {"limit": "2", "offset": str(offset), "select": "lines,supplierInfo"}
+                    for offset in (1, 3, 5)
+                ],
+            )
+
+    def test_successful_sync_replays_all_orders_from_the_first_page(self):
+        orders = [self._order("PO-1", "O"), self._order("PO-2", "Z")]
+        state = {}
+        for _ in range(2):
+            tap = TapUnit4(config=config(), state=state)
+            messages = []
+            with requests_mock.Mocker() as m, patch(
+                "singer.write_message",
+                side_effect=lambda message: messages.append(deepcopy(message)),
+            ):
+                m.get(
+                    f"{BASE}/purchaseOrders",
+                    [{"json": orders}, {"json": []}],
+                )
+                tap.streams["purchase_orders"].sync()
+                self.assertEqual(
+                    [message.record for message in messages if hasattr(message, "record")],
+                    orders,
+                )
+                self.assertEqual(
+                    [query(request)["offset"] for request in m.request_history],
+                    ["1", "3"],
+                )
+            states = [message.value for message in messages if hasattr(message, "value")]
+            state = states[-1]
+            self.assertNotIn(
+                "tracked_order_ids", state["bookmarks"].get("purchase_orders", {})
+            )
+
+    def test_legacy_tracking_does_not_trigger_detail_lookups(self):
+        state = {
             "bookmarks": {
                 "purchase_orders": {
-                    "source_scope": BASE,
-                    "tracked_order_ids": list(order_ids),
+                    "source_scope": "https://old.example.com",
+                    "tracked_order_ids": ["MISSING"],
                 }
             }
         }
-
-    @staticmethod
-    def _sync(tap):
-        messages = []
-        with patch(
-            "singer.write_message",
-            side_effect=lambda message: messages.append(deepcopy(message)),
-        ):
-            tap.streams["purchase_orders"].sync()
-        return (
-            [message.record for message in messages if hasattr(message, "record")],
-            [message.value for message in messages if hasattr(message, "value")],
-        )
-
-    def test_open_then_terminal_order_emits_final_observation_and_retires(self):
-        for status in ("T", "Z"):
-            with self.subTest(status=status):
-                tap = TapUnit4(config=config())
-                opened = self._order()
-                with requests_mock.Mocker() as m:
-                    m.get(f"{BASE}/purchaseOrders", json=[opened])
-                    emitted, states = self._sync(tap)
-                    self.assertEqual(emitted, [opened])
-                    self.assertEqual(m.call_count, 1)
-                self.assertEqual(
-                    states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-                    ["PO-1"],
-                )
-
-                resumed = TapUnit4(config=config(), state=states[-1])
-                current = self._order("PO-2")
-                finished = self._order(status=status, delivered=7)
-                with requests_mock.Mocker() as m:
-                    m.get(f"{BASE}/purchaseOrders", json=[current])
-                    m.get(f"{BASE}/purchaseOrders/PO-1", json=finished)
-                    emitted, states = self._sync(resumed)
-                    self.assertEqual(emitted, [current, finished])
-                    detail = m.request_history[-1]
-                    self.assertEqual(query(detail), {"select": "lines,supplierInfo"})
-                    expected = base64.b64encode(b"user:secret").decode()
-                    self.assertEqual(detail.headers["Authorization"], f"Basic {expected}")
-                self.assertEqual(
-                    states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-                    ["PO-2"],
-                )
-
-                resumed = TapUnit4(config=config(), state=states[-1])
-                with requests_mock.Mocker() as m:
-                    m.get(f"{BASE}/purchaseOrders", json=[current])
-                    emitted, _ = self._sync(resumed)
-                    self.assertEqual(emitted, [current])
-                    self.assertEqual(m.call_count, 1)
-
-    def test_follow_up_starts_only_after_all_open_pages(self):
-        tap = TapUnit4(config=config(), state=self._state("PO-1", "PO-2"))
-        current = [self._order(f"PO-{number}") for number in (2, 3, 4)]
-        finished = self._order(status="Z", delivered=8)
+        stream = TapUnit4(config=config(), state=state).streams["purchase_orders"]
+        orders = [self._order("PO-1", "Z")]
         with requests_mock.Mocker() as m:
-            m.get(
-                f"{BASE}/purchaseOrders",
-                [{"json": current[:2]}, {"json": current[2:]}],
-            )
-            m.get(f"{BASE}/purchaseOrders/PO-1", json=finished)
-            emitted, states = self._sync(tap)
-            self.assertEqual(emitted, current + [finished])
-            self.assertEqual(
-                [query(request).get("offset") for request in m.request_history],
-                ["1", "3", None],
-            )
-        self.assertEqual(
-            states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-            ["PO-2", "PO-3", "PO-4"],
-        )
-
-    def test_nonterminal_follow_up_remains_tracked_and_preserves_native_id(self):
-        for order_id in (37, "PO /?1"):
-            for status in ("O", "B", "X"):
-                with self.subTest(order_id=order_id, status=status):
-                    tap = TapUnit4(
-                        config=config(), state=self._state(str(order_id))
-                    )
-                    order = self._order(order_id, status=status)
-                    with requests_mock.Mocker() as m:
-                        m.get(f"{BASE}/purchaseOrders", json=[])
-                        m.get(
-                            f"{BASE}/purchaseOrders/{quote(str(order_id), safe='')}",
-                            json=order,
-                        )
-                        emitted, states = self._sync(tap)
-                        self.assertEqual(emitted, [order])
-                        self.assertEqual(
-                            query(m.request_history[-1]),
-                            {"select": "lines,supplierInfo"},
-                        )
-                    self.assertEqual(
-                        states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-                        [str(order_id)],
-                    )
-
-    def test_terminal_order_in_custom_scan_is_not_tracked_or_fetched_twice(self):
-        tap = TapUnit4(
-            config=config(purchase_order_statuses="O,B,T,Z"),
-            state=self._state("PO-1"),
-        )
-        order = self._order(status="T", delivered=7)
-        with requests_mock.Mocker() as m:
-            m.get(f"{BASE}/purchaseOrders", json=[order])
-            emitted, states = self._sync(tap)
-            self.assertEqual(emitted, [order])
+            m.get(f"{BASE}/purchaseOrders", json=orders)
+            self.assertEqual(records(stream), orders)
             self.assertEqual(m.call_count, 1)
-        self.assertEqual(
-            states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"], []
-        )
 
-    def test_failed_open_scan_preserves_tracking_and_never_starts_follow_up(self):
-        tap = TapUnit4(config=config(), state=self._state("PO-1"))
-        with requests_mock.Mocker() as m, patch("singer.write_message"):
+    def test_later_page_failure_is_fatal(self):
+        stream = TapUnit4(config=config()).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
             m.get(
                 f"{BASE}/purchaseOrders",
                 [
-                    {"json": [self._order("PO-2"), self._order("PO-3")]},
+                    {"json": [self._order("PO-1"), self._order("PO-2")]},
                     {"status_code": 400},
                 ],
             )
-            m.get(f"{BASE}/purchaseOrders/PO-1", json=self._order(status="Z"))
             with self.assertRaises(FatalAPIError):
-                tap.streams["purchase_orders"].sync()
+                records(stream)
             self.assertEqual(m.call_count, 2)
-        self.assertEqual(
-            tap.state["bookmarks"]["purchase_orders"]["tracked_order_ids"], ["PO-1"]
-        )
-
-    def test_failed_later_lookup_does_not_publish_earlier_retirement(self):
-        tap = TapUnit4(config=config(), state=self._state("PO-1", "PO-2"))
-        tap.streams["purchase_orders"].STATE_MSG_FREQUENCY = 1
-        messages = []
-        with requests_mock.Mocker() as m, patch(
-            "singer.write_message",
-            side_effect=lambda message: messages.append(deepcopy(message)),
-        ):
-            m.get(f"{BASE}/purchaseOrders", json=[])
-            m.get(f"{BASE}/purchaseOrders/PO-1", json=self._order(status="T"))
-            m.get(f"{BASE}/purchaseOrders/PO-2", status_code=404)
-            with self.assertRaises(FatalAPIError):
-                tap.streams["purchase_orders"].sync()
-        self.assertEqual(
-            tap.state["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-            ["PO-1", "PO-2"],
-        )
-        states = [message.value for message in messages if hasattr(message, "value")]
-        self.assertEqual(
-            states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-            ["PO-1", "PO-2"],
-        )
-
-    def test_invalid_detail_after_full_page_cannot_retire_tracking(self):
-        valid = self._order(status="Z")
-        responses = [
-            {"status_code": 404},
-            {"status_code": 204},
-            {"content": b""},
-            {"text": "<html>"},
-            {"json": []},
-            {"json": None},
-            {"json": {}},
-            {"json": {**valid, "id": "OTHER"}},
-        ]
-        for response in responses:
-            with self.subTest(response=response):
-                tap = TapUnit4(
-                    config=config(page_size=1), state=self._state("PO-1")
-                )
-                with requests_mock.Mocker() as m, patch("singer.write_message"):
-                    m.get(
-                        f"{BASE}/purchaseOrders",
-                        [{"json": [self._order("PO-2")]}, {"json": []}],
-                    )
-                    m.get(f"{BASE}/purchaseOrders/PO-1", **response)
-                    with self.assertRaises(FatalAPIError):
-                        tap.streams["purchase_orders"].sync()
-                self.assertEqual(
-                    tap.state["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-                    ["PO-1"],
-                )
-
-    def test_follow_up_preserves_nullable_fields_from_the_shared_schema(self):
-        for changes, expected_tracking in (
-            ({"supplierInfo": None}, ["PO-1"]),
-            ({"lines": None}, ["PO-1"]),
-            ({"lines": [None]}, ["PO-1"]),
-            ({"orderStatus": None}, ["PO-1"]),
-            ({"orderStatus": ""}, ["PO-1"]),
-            ({"orderStatus": "T", "supplierInfo": None}, []),
-        ):
-            with self.subTest(changes=changes):
-                tap = TapUnit4(config=config(), state=self._state("PO-1"))
-                order = {**self._order(status="B"), **changes}
-                with requests_mock.Mocker() as m:
-                    m.get(f"{BASE}/purchaseOrders", json=[])
-                    m.get(f"{BASE}/purchaseOrders/PO-1", json=order)
-                    emitted, states = self._sync(tap)
-                self.assertEqual(emitted, [order])
-                self.assertEqual(
-                    states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-                    expected_tracking,
-                )
-
-    def test_failed_record_emission_replays_final_order_from_previous_state(self):
-        original = self._state("PO-1")
-        tap = TapUnit4(config=config(), state=deepcopy(original))
-        finished = self._order(status="Z", delivered=7)
-
-        def fail_record(message):
-            if hasattr(message, "record"):
-                raise OSError("Synthetic output failure")
-
-        with requests_mock.Mocker() as m, patch(
-            "singer.write_message", side_effect=fail_record
-        ):
-            m.get(f"{BASE}/purchaseOrders", json=[])
-            m.get(f"{BASE}/purchaseOrders/PO-1", json=finished)
-            with self.assertRaises(OSError):
-                tap.streams["purchase_orders"].sync()
-        self.assertEqual(
-            tap.state["bookmarks"]["purchase_orders"]["tracked_order_ids"], ["PO-1"]
-        )
-        resumed = TapUnit4(config=config(), state=original)
-        with requests_mock.Mocker() as m:
-            m.get(f"{BASE}/purchaseOrders", json=[])
-            m.get(f"{BASE}/purchaseOrders/PO-1", json=finished)
-            emitted, states = self._sync(resumed)
-        self.assertEqual(emitted, [finished])
-        self.assertEqual(
-            states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"], []
-        )
-
-    def test_tracking_cannot_be_reused_for_another_source(self):
-        for overrides in (
-            {"base_url": "https://other.example.com"},
-            {"environment": "other"},
-            {"administration": "02"},
-        ):
-            with self.subTest(overrides=overrides):
-                tap = TapUnit4(
-                    config=config(**overrides), state=self._state("PO-1")
-                )
-                with requests_mock.Mocker() as m, patch("singer.write_message"):
-                    with self.assertRaises(FatalAPIError):
-                        tap.streams["purchase_orders"].sync()
-                    self.assertEqual(m.request_history, [])
-
-    def test_malformed_or_unscoped_tracking_fails_before_requests(self):
-        bookmarks = [
-            {"source_scope": BASE, "tracked_order_ids": "PO-1"},
-            {"source_scope": BASE, "tracked_order_ids": [1]},
-            {"source_scope": BASE, "tracked_order_ids": [" "]},
-            {"tracked_order_ids": ["PO-1"]},
-        ]
-        for bookmark in bookmarks:
-            with self.subTest(bookmark=bookmark):
-                tap = TapUnit4(
-                    config=config(), state={"bookmarks": {"purchase_orders": bookmark}}
-                )
-                with requests_mock.Mocker() as m, patch("singer.write_message"):
-                    with self.assertRaises(FatalAPIError):
-                        tap.streams["purchase_orders"].sync()
-                    self.assertEqual(m.request_history, [])
-
-    def test_invalid_open_order_identity_does_not_create_tracking(self):
-        for order_id in (None, True, [], {}, " "):
-            with self.subTest(order_id=order_id):
-                tap = TapUnit4(config=config())
-                with requests_mock.Mocker() as m, patch("singer.write_message"):
-                    m.get(
-                        f"{BASE}/purchaseOrders", json=[self._order(order_id)]
-                    )
-                    with self.assertRaises(FatalAPIError):
-                        tap.streams["purchase_orders"].sync()
-                self.assertNotIn(
-                    "tracked_order_ids", tap.state["bookmarks"]["purchase_orders"]
-                )
-
-    @patch("time.sleep", lambda *_: None)
-    def test_transient_follow_up_failure_retries_without_losing_final_order(self):
-        tap = TapUnit4(config=config(), state=self._state("PO-1"))
-        finished = self._order(status="T", delivered=7)
-        with requests_mock.Mocker() as m:
-            m.get(f"{BASE}/purchaseOrders", json=[])
-            m.get(
-                f"{BASE}/purchaseOrders/PO-1",
-                [{"status_code": 503}, {"json": finished}],
-            )
-            emitted, states = self._sync(tap)
-            self.assertEqual(emitted, [finished])
-            self.assertEqual(m.call_count, 3)
-        self.assertEqual(
-            states[-1]["bookmarks"]["purchase_orders"]["tracked_order_ids"], []
-        )
-
-    def test_permanent_follow_up_errors_preserve_tracking_without_retry(self):
-        for status, error in (
-            (401, InvalidCredentialsError),
-            (403, FatalAPIError),
-            (400, FatalAPIError),
-        ):
-            with self.subTest(status=status):
-                tap = TapUnit4(config=config(), state=self._state("PO-1"))
-                with requests_mock.Mocker() as m, patch("singer.write_message"):
-                    m.get(f"{BASE}/purchaseOrders", json=[])
-                    m.get(f"{BASE}/purchaseOrders/PO-1", status_code=status)
-                    with self.assertRaises(error):
-                        tap.streams["purchase_orders"].sync()
-                    self.assertEqual(m.call_count, 2)
-                self.assertEqual(
-                    tap.state["bookmarks"]["purchase_orders"]["tracked_order_ids"],
-                    ["PO-1"],
-                )
 
 
 class SellOrderReplicationTests(unittest.TestCase):

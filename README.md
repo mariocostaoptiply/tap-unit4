@@ -2,7 +2,7 @@
 
 Read-only Singer tap for the **Unit4 Wholesale REST API v1**, built with `hotglue_singer_sdk`.
 It replaces the Unit4 side of the Nestinox Alumio integration (`Nestinox_Alumio.ndjson`);
-endpoints, filters and payloads mirror that export.
+endpoints and payloads follow that export, except purchase orders are unfiltered.
 
 ## Config
 
@@ -15,7 +15,6 @@ endpoints, filters and payloads mirror that export.
 | `start_date` | no | today | First sell-order day when there is no bookmark |
 | `sell_order_lookback_days` | no | `1` | Days before the bookmark day re-read each run |
 | `sell_order_statuses` | no | `A,Z,O` | `salesOrders` `status` filter |
-| `purchase_order_statuses` | no | `O,B` | `purchaseOrders` `OrderStatus` filter |
 | `stock_skip_inactive` | no | `false` | Skip stock calls for inactive products |
 | `stock_batch_size` | no | `100` | Products per `requestProductStock` call |
 | `unit4_product_stock_request_workers` | no | `10` | Concurrent `requestProductStock` requests (`1`–`32`) |
@@ -30,7 +29,7 @@ URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
 | `products` | `GET /products?select=productClassification` | `productCode`, `unitCode` | FULL_TABLE |
 | `product_stock` | `POST /requestProductStock`, up to `stock_batch_size` products per call | `productCode`, `unitCode`, `resultIndex` | FULL_TABLE |
 | `sell_orders` | `GET /salesOrders?filter=orderDate gt <day> and status in (...)&select=lines` | `id` | INCREMENTAL on `orderDate` |
-| `purchase_orders` | `GET /purchaseOrders?filter=OrderStatus in (...)&select=lines,supplierInfo`, then `GET /purchaseOrders/{id}?select=lines,supplierInfo` for missing tracked orders | `id` | FULL_TABLE plus tracked-order follow-up |
+| `purchase_orders` | `GET /purchaseOrders?select=lines,supplierInfo` | `id` | FULL_TABLE (all orders, every run) |
 
 Optiply `skuCode` is `<productCode>-<unitCode>`; sell-order lines join to products on
 `lines[].productIdentifier.productCode` + `lines[].unitCode`. Alumio divided `costPrice` by 100
@@ -64,22 +63,11 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
   sentinel `start_date` aborts before HTTP requests. To recover poisoned state,
   restore the last-good sales bookmark, or clear only `sell_orders` state and set
   a deliberate historical `start_date`; without either, the tap starts from today.
-- **Purchase orders:** finish the entire filtered, paginated scan first. Track observed
-  nonterminal order IDs, then fetch previously tracked IDs absent from that scan by ID,
-  without a status filter or pagination. Both phases emit the same `purchase_orders`
-  records with native IDs, `orderDate`, header status, supplier info and nested lines.
+- **Purchase orders:** read every page without a status or date filter, including
+  historical and closed orders. Keep native IDs, `orderDate`, header status, supplier
+  info and nested lines unchanged. Every run starts at offset `1`; previous tracking
+  state is not used, and there are no individual order lookups or tracking updates.
   The tap does not derive receipts, change delivered quantities or close Optiply orders.
-- **Purchase state:** `bookmarks.purchase_orders` stores `tracked_order_ids` (strings)
-  and `source_scope` (the normalized Unit4 REST base URL, including environment and
-  administration). Only header `orderStatus` values `T` and `Z` retire tracking; terminal
-  line statuses alone do not. Other header statuses remain tracked. Tracking changes
-  are published only after every page, lookup and record emission succeeds.
-  Missing, malformed or mismatched detail responses fail the stream without retiring
-  IDs; a detail 404 is never interpreted as completion or end of pagination.
-  State from another source, or nonempty tracking without a source scope, fails before
-  requests. An empty initial state tracks currently observed orders only, not historical
-  closed orders. This flow relies on HotGlue promoting state only after end-to-end job
-  success; a failed ETL must resume from the previous successful job state.
 - **Deletes:** not exposed by the Alumio contract.
 
 ## Unverified against a live tenant
@@ -98,3 +86,21 @@ uv venv -p 3.10 && uv pip install -e '.[test]'
 .venv/bin/python -m pytest -q tests
 .venv/bin/tap-unit4 --config config.json --discover
 ```
+
+### Timing purchase-order extraction
+
+Use a Singer catalog with stream-root metadata `selected: true` only for
+`purchase_orders` and `selected: false` for the other streams. Generate a catalog with
+`--discover` if needed. Time the extraction alone, without an ETL or target:
+
+```bash
+/usr/bin/time -p .venv/bin/tap-unit4 \
+  --config /path/to/unit4-config.json \
+  --catalog /path/to/purchase-orders.catalog.json > /dev/null
+```
+
+Do not use `--test`, which limits record extraction. No `--state` is required.
+`select=lines,supplierInfo` remains enabled so timing includes the normal nested
+payload. Existing `page_size`, `max_pages`, retry and timeout settings still apply;
+a `max_pages` error means the full scan did not finish. A live scan needs approval
+for the source account and page budget before running it.
