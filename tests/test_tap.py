@@ -693,6 +693,207 @@ class PurchaseOrderFullSyncTests(unittest.TestCase):
                 records(stream)
             self.assertEqual(m.call_count, 2)
 
+    def test_concurrent_pages_preserve_order_and_payloads(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=10)
+        ).streams["purchase_orders"]
+        orders = [self._order(f"PO-{i}", "Z" if i % 2 else "O", i) for i in range(21)]
+        barrier = threading.Barrier(10, timeout=3)
+        later_page_done = threading.Event()
+        lock = threading.Lock()
+        active = peak = 0
+        completed = []
+        parse_threads = []
+        main_thread = threading.get_ident()
+        original_parse = stream.parse_response
+
+        def send(prepared, **_kwargs):
+            nonlocal active, peak
+            offset = int(query(prepared)["offset"])
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                if offset in range(3, 23, 2):
+                    barrier.wait()
+                if offset == 3:
+                    self.assertTrue(later_page_done.wait(timeout=3))
+                response = requests.Response()
+                response.status_code = 200
+                response._content = json.dumps(orders[offset - 1:offset + 1]).encode()
+                response.request = prepared
+                with lock:
+                    completed.append(offset)
+                if offset == 5:
+                    later_page_done.set()
+                return response
+            finally:
+                with lock:
+                    active -= 1
+
+        def parse(response):
+            parse_threads.append(threading.get_ident())
+            yield from original_parse(response)
+
+        with patch.object(stream.requests_session, "send", side_effect=send):
+            with patch.object(stream, "parse_response", side_effect=parse):
+                self.assertEqual(records(stream), orders)
+        self.assertEqual(peak, 10)
+        self.assertLess(completed.index(5), completed.index(3))
+        self.assertEqual(set(parse_threads), {main_thread})
+
+    def test_serial_and_concurrent_scans_match_at_page_boundaries(self):
+        for workers in (1, 5, 10):
+            for count in (0, 1, 2, 3, 4, 10, 11, 12, 20, 21, 22):
+                for ending in (200, 204, 404):
+                    if count == 0 and ending == 404:
+                        continue
+                    with self.subTest(workers=workers, count=count, ending=ending):
+                        orders = [self._order(f"PO-{i}") for i in range(count)]
+                        stream = TapUnit4(
+                            config=config(unit4_purchase_orders_request_workers=workers)
+                        ).streams["purchase_orders"]
+
+                        def page(request, context):
+                            offset = int(query(request)["offset"]) - 1
+                            context.status_code = 200 if offset < count else ending
+                            return orders[offset:offset + 2]
+
+                        with requests_mock.Mocker() as m:
+                            m.get(f"{BASE}/purchaseOrders", json=page)
+                            self.assertEqual(records(stream), orders)
+                            offsets = [query(request)["offset"] for request in m.request_history]
+                            self.assertEqual(len(offsets), len(set(offsets)))
+                            self.assertTrue(all("filter" not in query(r) for r in m.request_history))
+
+    @patch("time.sleep", lambda *_: None)
+    def test_concurrent_retries_do_not_repeat_or_lose_records(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=5)
+        ).streams["purchase_orders"]
+        orders = [self._order(f"PO-{i}") for i in range(7)]
+        attempts = 0
+
+        def page(request, context):
+            nonlocal attempts
+            offset = int(query(request)["offset"]) - 1
+            context.status_code = 200
+            if offset == 2:
+                attempts += 1
+                if attempts < 3:
+                    context.status_code = 429 if attempts == 1 else 503
+                    context.headers["Retry-After"] = "0"
+                    return []
+            return orders[offset:offset + 2]
+
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/purchaseOrders", json=page)
+            self.assertEqual(records(stream), orders)
+        self.assertEqual(attempts, 3)
+
+    def test_duplicate_id_aborts_before_emitting_the_bad_page(self):
+        pages = (
+            [[self._order("PO-1"), self._order("PO-1")]],
+            [[self._order("PO-1"), self._order("PO-2")], [self._order("PO-1")]],
+            [
+                [self._order("PO-1"), self._order("PO-2")],
+                [self._order("PO-3"), self._order("PO-4")],
+                [self._order("PO-1"), self._order("PO-2")],
+            ],
+            [[self._order(37), self._order("37")]],
+        )
+        for source_pages in pages:
+            with self.subTest(pages=source_pages):
+                stream = TapUnit4(
+                    config=config(unit4_purchase_orders_request_workers=5)
+                ).streams["purchase_orders"]
+                emitted = []
+
+                def page(request, _context):
+                    index = (int(query(request)["offset"]) - 1) // 2
+                    return source_pages[index] if index < len(source_pages) else []
+
+                with requests_mock.Mocker() as m:
+                    m.get(f"{BASE}/purchaseOrders", json=page)
+                    with self.assertRaises(FatalAPIError):
+                        for row in stream.get_records(None):
+                            emitted.append(row)
+                ids = [str(row["id"]) for row in emitted]
+                self.assertEqual(len(ids), len(set(ids)))
+
+    def test_concurrent_failure_replays_from_first_page(self):
+        for status in (400, 401, 403, 500):
+            with self.subTest(status=status):
+                orders = [self._order(f"PO-{i}") for i in range(5)]
+                tap = TapUnit4(config=config(unit4_purchase_orders_request_workers=5))
+                messages = []
+                stream = tap.streams["purchase_orders"]
+                stream.STATE_MSG_FREQUENCY = 1
+
+                def page(request, context):
+                    offset = int(query(request)["offset"]) - 1
+                    context.status_code = status if offset == 2 else 200
+                    return orders[offset:offset + 2]
+
+                error = InvalidCredentialsError if status == 401 else (
+                    RetriableAPIError if status == 500 else FatalAPIError
+                )
+                with requests_mock.Mocker() as m, patch("time.sleep", lambda *_: None):
+                    m.get(f"{BASE}/purchaseOrders", json=page)
+                    with patch(
+                        "singer.write_message",
+                        side_effect=lambda message: messages.append(deepcopy(message)),
+                    ):
+                        with self.assertRaises(error):
+                            stream.sync()
+                states = [message.value for message in messages if hasattr(message, "value")]
+                resumed = TapUnit4(config=config(), state=states[-1])
+                with requests_mock.Mocker() as m:
+                    m.get(
+                        f"{BASE}/purchaseOrders",
+                        json=lambda request, _context: orders[
+                            int(query(request)["offset"]) - 1:int(query(request)["offset"]) + 1
+                        ],
+                    )
+                    self.assertEqual(records(resumed.streams["purchase_orders"]), orders)
+                    self.assertEqual(query(m.request_history[0])["offset"], "1")
+
+    def test_prefetch_does_not_exceed_max_pages(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=5, max_pages=2)
+        ).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
+            m.get(
+                f"{BASE}/purchaseOrders",
+                json=lambda request, _context: [
+                    self._order(query(request)["offset"] + suffix) for suffix in ("a", "b")
+                ],
+            )
+            with self.assertRaises(FatalAPIError):
+                records(stream)
+            self.assertEqual([query(r)["offset"] for r in m.request_history], ["1", "3"])
+
+    def test_invalid_workers_fail_before_requests(self):
+        for workers in (0, 11):
+            with self.subTest(workers=workers):
+                stream = TapUnit4(
+                    config=config(unit4_purchase_orders_request_workers=workers)
+                ).streams["purchase_orders"]
+                with requests_mock.Mocker() as m:
+                    with self.assertRaises(FatalAPIError):
+                        records(stream)
+                    self.assertEqual(m.request_history, [])
+
+    def test_oversized_page_is_not_silently_overlapped(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=5)
+        ).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/purchaseOrders", json=[self._order(f"PO-{i}") for i in range(3)])
+            with self.assertRaises(FatalAPIError):
+                records(stream)
+            self.assertEqual(m.call_count, 1)
+
 
 class SellOrderReplicationTests(unittest.TestCase):
     def _filter(self, tap):

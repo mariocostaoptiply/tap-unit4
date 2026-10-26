@@ -18,6 +18,7 @@ endpoints and payloads follow that export, except purchase orders are unfiltered
 | `stock_skip_inactive` | no | `false` | Skip stock calls for inactive products |
 | `stock_batch_size` | no | `100` | Products per `requestProductStock` call |
 | `unit4_product_stock_request_workers` | no | `10` | Concurrent `requestProductStock` requests (`1`–`32`) |
+| `unit4_purchase_orders_request_workers` | no | `1` | Concurrent purchase-order page requests (`1`–`10`); omitted means sequential extraction |
 | `page_size` / `max_pages` / `request_timeout` | no | `100` / `10000` / `300` | |
 
 URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
@@ -68,6 +69,16 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
   info and nested lines unchanged. Every run starts at offset `1`; previous tracking
   state is not used, and there are no individual order lookups or tracking updates.
   The tap does not derive receipts, change delivered quantities or close Optiply orders.
+  Fetch the first page alone, then prefetch at most the configured number of pages.
+  Consume responses in offset order; parsing, pagination guards and Singer emission
+  stay on the main thread. Up to `workers - 1` speculative pages beyond the end may
+  already be requested; their records are never emitted.
+  Missing/invalid IDs, duplicate IDs within or across pages, oversized pages and
+  failures on required pages abort the scan rather than silently drop or deduplicate
+  data. IDs are compared as strings and retained for the scan; buffered payloads are
+  bounded by the worker count. Failed full scans restart at the first page.
+  Offset pagination still requires stable source ordering: duplicate detection cannot
+  prove that no unseen orders were skipped if Unit4 changes the dataset during a run.
 - **Deletes:** not exposed by the Alumio contract.
 
 ## Unverified against a live tenant
@@ -104,3 +115,8 @@ Do not use `--test`, which limits record extraction. No `--state` is required.
 payload. Existing `page_size`, `max_pages`, retry and timeout settings still apply;
 a `max_pages` error means the full scan did not finish. A live scan needs approval
 for the source account and page budget before running it.
+
+Set `unit4_purchase_orders_request_workers` to `1` and then `10` to compare serial
+and concurrent extraction with the same catalog and `page_size`. A full sync
+intentionally re-emits the same IDs on every run; downstream writes still need
+idempotent upserts. A successful tap scan alone does not prove target idempotency.

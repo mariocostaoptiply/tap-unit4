@@ -95,6 +95,15 @@ class TapUnit4(Tap):
                 "Concurrent requestProductStock HTTP requests; allowed range 1-32."
             ),
         ),
+        th.Property(
+            "unit4_purchase_orders_request_workers",
+            th.IntegerType,
+            default=1,
+            description=(
+                "Concurrent purchaseOrders page requests; allowed range 1-10. "
+                "Use 1 for sequential extraction."
+            ),
+        ),
         th.Property("page_size", th.IntegerType, default=100, description="limit per page."),
         th.Property(
             "max_pages",

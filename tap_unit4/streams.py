@@ -23,6 +23,7 @@ from tap_unit4.client import Unit4Stream
 
 STATUS_CODE = re.compile(r"^[A-Za-z0-9]{1,10}$")
 MAX_PRODUCT_STOCK_REQUEST_WORKERS = 32
+MAX_PURCHASE_ORDER_REQUEST_WORKERS = 10
 
 
 def nullable(*type_names: str) -> list[str]:
@@ -469,6 +470,80 @@ class PurchaseOrdersStream(Unit4Stream):
 
     def extra_url_params(self, context) -> dict[str, t.Any]:
         return {"select": "lines,supplierInfo"}
+
+    @property
+    def purchase_order_request_workers(self) -> int:
+        """Return the bounded number of concurrent purchase-order requests."""
+        workers = self.config.get("unit4_purchase_orders_request_workers", 1)
+        if (
+            isinstance(workers, bool)
+            or not isinstance(workers, int)
+            or not 1 <= workers <= MAX_PURCHASE_ORDER_REQUEST_WORKERS
+        ):
+            raise FatalAPIError(
+                "unit4_purchase_orders_request_workers must be an integer between "
+                f"1 and {MAX_PURCHASE_ORDER_REQUEST_WORKERS}."
+            )
+        return workers
+
+    def request_records(self, context) -> t.Iterable[dict]:
+        workers = self.purchase_order_request_workers
+        page_size = self.page_size
+        self._last_page_fingerprint = None
+        self._pages_fetched = 0
+        seen_ids: set[str] = set()
+        decorated_request = self.request_decorator(self._request)
+        pending = deque()
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            try:
+                prepared = self.prepare_request(context, None)
+                pending.append((
+                    1, prepared, executor.submit(decorated_request, prepared, context),
+                ))
+                next_offset = 1 + page_size
+                while pending:
+                    offset, prepared, future = pending.popleft()
+                    response = future.result()
+                    self.update_sync_costs(prepared, response, context)
+                    page = list(self.parse_response(response))
+                    if len(page) > page_size:
+                        raise FatalAPIError(
+                            "Unit4 purchaseOrders returned more records than the requested limit."
+                        )
+                    continuation = self.get_next_page_token(response, offset)
+                    for record in page:
+                        value = record.get("id")
+                        if (
+                            isinstance(value, bool)
+                            or not isinstance(value, (str, int))
+                            or not str(value).strip()
+                        ):
+                            raise FatalAPIError("Unit4 purchase order has a missing or invalid id.")
+                        order_id = str(value)
+                        if order_id in seen_ids:
+                            raise FatalAPIError(
+                                f"Duplicate Unit4 purchase order {order_id!r}; "
+                                "pagination may have changed during extraction."
+                            )
+                        seen_ids.add(order_id)
+                    yield from page
+                    if continuation is None:
+                        return
+                    # Confirm the first full page before prefetching; consume futures in offset order.
+                    while (
+                        len(pending) < workers
+                        and (next_offset - 1) // page_size < self.max_pages
+                    ):
+                        prepared = self.prepare_request(context, next_offset)
+                        pending.append((
+                            next_offset, prepared,
+                            executor.submit(decorated_request, prepared, context),
+                        ))
+                        next_offset += page_size
+            finally:
+                for _, _, future in pending:
+                    future.cancel()
 
 
 def _parse_day(value: t.Any) -> date:
