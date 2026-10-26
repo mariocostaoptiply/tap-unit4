@@ -5,7 +5,7 @@ Endpoints and filters follow the Nestinox Alumio integration, except purchase or
   products         GET  /products?select=productClassification          FULL_TABLE
   product_stock    POST /requestProductStock (batched products)         FULL_TABLE
   sell_orders      GET  /salesOrders?filter=orderDate gt ... &select=lines  INCREMENTAL (orderDate)
-  purchase_orders  GET  /purchaseOrders?select=lines,supplierInfo        FULL_TABLE
+  purchase_orders  GET  /purchaseOrders?select=lines,supplierInfo        CUSTOM (oldest O/B date)
 """
 
 from __future__ import annotations
@@ -447,7 +447,7 @@ class SellOrdersStream(Unit4Stream):
 
 
 class PurchaseOrdersStream(Unit4Stream):
-    """All Unit4 purchase orders with lines and supplier info on every run."""
+    """Purchase orders from the earliest unfinished date, including final updates."""
 
     name = "purchase_orders"
     path = "/purchaseOrders"
@@ -459,17 +459,149 @@ class PurchaseOrdersStream(Unit4Stream):
         "additionalProperties": True,
         "properties": {
             "id": {"type": ["string", "integer"]},
+            "adminCode": STRING,
+            "orderCode": STRING,
+            "automaticDiscountCalculation": BOOLEAN,
+            "branchCode": STRING,
+            "currencyCode": STRING,
+            "contactPersonCode": STRING,
+            "deliveryConditionCode": STRING,
+            "deliveryConditionDescription": STRING,
+            "discountAmount": NUMBER,
+            "discountPercentage": NUMBER,
             "orderDate": STRING,
             "orderStatus": STRING,
-            "OrderStatus": STRING,
-            "lines": array_of(obj()),
-            "supplierInfo": obj(),
+            "orderConfirmationText": STRING,
+            "textLinesAtAnOrder": STRING,
+            "purchaseOrderInstructionsText": STRING,
+            "orderStatusDescription": STRING,
+            "orderType": STRING,
+            "paymentConditionCode": STRING,
+            "reference": STRING,
+            "supplierCode": STRING,
+            "warehouseCode": STRING,
+            "canCollect": BOOLEAN,
+            "propertiesToInclude": STRING,
+            "lines": array_of(
+                obj(
+                    {
+                        "id": STRING,
+                        "adminCode": STRING,
+                        "orderCode": STRING,
+                        "lineNumber": NUMBER,
+                        "deliveryAfter": STRING,
+                        "deliveryBefore": STRING,
+                        "deliveryLines": array_of(
+                            obj(
+                                {
+                                    "id": STRING,
+                                    "adminCode": STRING,
+                                    "orderCode": STRING,
+                                    "orderLineNumber": NUMBER,
+                                    "deliveryLineNumber": NUMBER,
+                                    "confirmationDate": STRING,
+                                    "deliveryAfter": STRING,
+                                    "deliveryBefore": STRING,
+                                    "quantityDelivered": NUMBER,
+                                    "quantityOrdered": NUMBER,
+                                    "remainderExpired": BOOLEAN,
+                                    "statusCode": STRING,
+                                    "statusDescription": STRING,
+                                    "warehouseCode": STRING,
+                                    "instructionAtDelivery": STRING,
+                                    "splitDeliveryLine": BOOLEAN,
+                                    "adjustShipment": BOOLEAN,
+                                }
+                            )
+                        ),
+                        "discountAmount": NUMBER,
+                        "discountPercentage": NUMBER,
+                        "discountPercentageExtra": NUMBER,
+                        "discountProductGroupPercentage": NUMBER,
+                        "discountProductGroupPercentageExtra": NUMBER,
+                        "price": NUMBER,
+                        "productIdentifier": obj(
+                            {
+                                "productCode": STRING,
+                                "externalProductCode": STRING,
+                                "productGroupCodeExternalProduct": STRING,
+                            }
+                        ),
+                        "qualityCode": NUMBER,
+                        "quantityDelivered": NUMBER,
+                        "quantityOrdered": NUMBER,
+                        "statusCode": STRING,
+                        "statusDescription": STRING,
+                        "unitCode": STRING,
+                        "warehouseCode": STRING,
+                        "purchaseContractCode": STRING,
+                        "pickupOrganisation": STRING,
+                        "pickupAddressOneOff": BOOLEAN,
+                        "textLinesAtOrderLine": STRING,
+                        "purchaseOrderLineInstructionText": STRING,
+                        "productDescriptionOrderLineText": STRING,
+                        # Empty sample arrays do not establish their element types.
+                        "notes": array_of({}),
+                        "priceAdjustments": array_of({}),
+                    }
+                )
+            ),
+            "supplierInfo": obj(
+                {
+                    "id": STRING,
+                    "organisationInfo": obj({"id": STRING, "name": STRING}),
+                }
+            ),
         },
         "required": ["id"],
     }
 
     def extra_url_params(self, context) -> dict[str, t.Any]:
-        return {"select": "lines,supplierInfo"}
+        params = {"select": "lines,supplierInfo"}
+        marker = self.get_context_state(context).get("open_order_date")
+        if marker is not None:
+            try:
+                lower_bound = date.fromisoformat(marker)
+            except (TypeError, ValueError) as exc:
+                raise FatalAPIError(
+                    "Unit4 purchase_orders open_order_date must be YYYY-MM-DD."
+                ) from exc
+            if lower_bound == date.max:
+                raise FatalAPIError(
+                    "Unit4 purchase_orders open_order_date cannot be 9999-12-31. "
+                    "Restore the last-good bookmark or clear only purchase_orders state."
+                )
+            params["filter"] = f"orderDate ge {lower_bound.isoformat()}"
+        return params
+
+    def get_records(self, context) -> t.Iterable[dict]:
+        earliest_open_date = None
+        for row in super().get_records(context):
+            status = row.get("orderStatus")
+            if not isinstance(status, str) or not status.strip():
+                raise FatalAPIError("Unit4 purchase order is missing a valid orderStatus.")
+            if status in ("O", "B"):
+                marker = row.get("orderDate")
+                if not isinstance(marker, str):
+                    raise FatalAPIError("Unit4 unfinished purchase order is missing orderDate.")
+                try:
+                    order_day = datetime.fromisoformat(marker.replace("Z", "+00:00")).date()
+                except ValueError as exc:
+                    raise FatalAPIError(
+                        "Unit4 unfinished purchase order has an invalid orderDate."
+                    ) from exc
+                if order_day != date.max:
+                    earliest_open_date = (
+                        order_day if earliest_open_date is None
+                        else min(earliest_open_date, order_day)
+                    )
+            yield row
+
+        # Exhaustion follows emission of every record; failures and partial reads never commit.
+        if self.selected and earliest_open_date is not None:
+            self.get_context_state(context)["open_order_date"] = (
+                earliest_open_date.isoformat()
+            )
 
     @property
     def purchase_order_request_workers(self) -> int:

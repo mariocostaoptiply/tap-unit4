@@ -54,6 +54,40 @@ class DiscoveryTests(unittest.TestCase):
         json.dumps(catalog)
         self.assertEqual(len(catalog["streams"]), 4)
 
+    def test_purchase_order_catalog_exposes_native_attributes(self):
+        catalog = TapUnit4(config=config()).catalog_dict
+        purchase_orders = next(
+            stream for stream in catalog["streams"]
+            if stream["tap_stream_id"] == "purchase_orders"
+        )
+        expected_fields = set("""
+            id adminCode orderCode automaticDiscountCalculation branchCode
+            currencyCode contactPersonCode deliveryConditionCode
+            deliveryConditionDescription discountAmount discountPercentage lines
+            orderConfirmationText textLinesAtAnOrder purchaseOrderInstructionsText
+            orderDate orderStatus orderStatusDescription orderType
+            paymentConditionCode reference supplierCode supplierInfo warehouseCode
+            canCollect propertiesToInclude
+        """.split())
+        properties = purchase_orders["schema"]["properties"]
+        self.assertEqual(set(properties), expected_fields)
+        metadata_fields = {
+            item["breadcrumb"][1]
+            for item in purchase_orders["metadata"]
+            if len(item["breadcrumb"]) == 2 and item["breadcrumb"][0] == "properties"
+        }
+        self.assertEqual(metadata_fields, expected_fields)
+        line_properties = properties["lines"]["items"]["properties"]
+        self.assertTrue({
+            "id", "productIdentifier", "unitCode", "quantityOrdered",
+            "quantityDelivered", "price", "deliveryAfter", "deliveryBefore",
+            "deliveryLines", "statusCode",
+        }.issubset(line_properties))
+        self.assertEqual(
+            set(properties["supplierInfo"]["properties"]),
+            {"id", "organisationInfo"},
+        )
+
     def test_password_is_secret(self):
         from hotglue_singer_sdk.helpers._secrets import is_common_secret_key
 
@@ -66,8 +100,9 @@ class AuthAndErrorTests(unittest.TestCase):
 
     def test_basic_auth_header_and_url(self):
         with requests_mock.Mocker() as m:
-            m.get(f"{BASE}/purchaseOrders", json=[{"id": 1}])
-            self.assertEqual(records(self.stream), [{"id": 1}])
+            order = {"id": 1, "orderStatus": "Z"}
+            m.get(f"{BASE}/purchaseOrders", json=[order])
+            self.assertEqual(records(self.stream), [order])
             sent = m.request_history[0]
             expected = base64.b64encode(b"user:secret").decode()
             self.assertEqual(sent.headers["Authorization"], f"Basic {expected}")
@@ -138,11 +173,12 @@ class AuthAndErrorTests(unittest.TestCase):
     @patch("time.sleep", lambda *_: None)
     def test_5xx_retries_then_succeeds(self):
         with requests_mock.Mocker() as m:
+            order = {"id": 9, "orderStatus": "Z"}
             m.get(
                 f"{BASE}/purchaseOrders",
-                [{"status_code": 503}, {"json": [{"id": 9}]}],
+                [{"status_code": 503}, {"json": [order]}],
             )
-            self.assertEqual(records(self.stream), [{"id": 9}])
+            self.assertEqual(records(self.stream), [order])
             self.assertEqual(m.call_count, 2)
 
     @patch("time.sleep", lambda *_: None)
@@ -591,7 +627,7 @@ class ProductStockTests(unittest.TestCase):
                 records(stream)
 
 
-class PurchaseOrderFullSyncTests(unittest.TestCase):
+class PurchaseOrderSyncTests(unittest.TestCase):
     @staticmethod
     def _order(order_id="PO-1", status="O", delivered=2):
         return {
@@ -634,40 +670,246 @@ class PurchaseOrderFullSyncTests(unittest.TestCase):
                 ],
             )
 
-    def test_successful_sync_replays_all_orders_from_the_first_page(self):
-        orders = [self._order("PO-1", "O"), self._order("PO-2", "Z")]
+    def test_completed_orders_emit_before_the_boundary_advances(self):
+        orders = [
+            {**self._order("HISTORY", "Z"), "orderDate": "2026-09-01"},
+            {**self._order("NEWER", "B"), "orderDate": "2026-09-12"},
+            {**self._order("OLDEST", "O"), "orderDate": "2026-09-10"},
+            {**self._order("TIED", "B"), "orderDate": "2026-09-10T18:00:00"},
+            {**self._order("RECENT-CLOSED", "Z"), "orderDate": "2026-09-30"},
+        ]
         state = {}
-        for _ in range(2):
-            tap = TapUnit4(config=config(), state=state)
-            messages = []
-            with requests_mock.Mocker() as m, patch(
-                "singer.write_message",
-                side_effect=lambda message: messages.append(deepcopy(message)),
-            ):
-                m.get(
-                    f"{BASE}/purchaseOrders",
-                    [{"json": orders}, {"json": []}],
+        previous_boundary = None
+        for completed_ids, expected_boundary in (
+            ((), "2026-09-10"),
+            (("OLDEST",), "2026-09-10"),
+            (("OLDEST", "TIED"), "2026-09-12"),
+            (("OLDEST", "TIED", "NEWER"), "2026-09-12"),
+        ):
+            with self.subTest(completed=completed_ids):
+                source = [
+                    {**row, "orderStatus": "Z"} if row["id"] in completed_ids else row
+                    for row in orders
+                    if previous_boundary is None or row["orderDate"] >= previous_boundary
+                ]
+                tap = TapUnit4(
+                    config=config(unit4_purchase_orders_request_workers=5), state=state
                 )
-                tap.streams["purchase_orders"].sync()
+                stream = tap.streams["purchase_orders"]
+                stream.STATE_MSG_FREQUENCY = 1
+                messages = []
+
+                def page(request, _context):
+                    offset = int(query(request)["offset"]) - 1
+                    return source[offset:offset + 2]
+
+                with requests_mock.Mocker() as m, patch(
+                    "singer.write_message",
+                    side_effect=lambda message: messages.append(deepcopy(message)),
+                ):
+                    m.get(f"{BASE}/purchaseOrders", json=page)
+                    stream.sync()
                 self.assertEqual(
                     [message.record for message in messages if hasattr(message, "record")],
-                    orders,
+                    source,
                 )
+                for request in m.request_history:
+                    params = query(request)
+                    self.assertEqual(
+                        params.get("filter"),
+                        f"orderDate ge {previous_boundary}" if previous_boundary else None,
+                    )
+                    self.assertEqual(params["select"], "lines,supplierInfo")
+                states = [message.value for message in messages if hasattr(message, "value")]
+                for interim in states[:-1]:
+                    self.assertEqual(
+                        interim["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        previous_boundary,
+                    )
+                state = states[-1]
                 self.assertEqual(
-                    [query(request)["offset"] for request in m.request_history],
-                    ["1", "3"],
+                    state["bookmarks"]["purchase_orders"]["open_order_date"],
+                    expected_boundary,
                 )
-            states = [message.value for message in messages if hasattr(message, "value")]
-            state = states[-1]
-            self.assertNotIn(
-                "tracked_order_ids", state["bookmarks"].get("purchase_orders", {})
+                previous_boundary = expected_boundary
+
+    def test_empty_or_completed_only_scan_preserves_the_boundary(self):
+        for boundary in (None, "2026-09-10"):
+            for orders in ([], [{"id": "CLOSED", "orderStatus": "Z"}]):
+                with self.subTest(boundary=boundary, orders=orders):
+                    state = {"bookmarks": {"purchase_orders": {}}}
+                    if boundary:
+                        state["bookmarks"]["purchase_orders"]["open_order_date"] = boundary
+                    tap = TapUnit4(config=config(), state=state)
+                    with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                        m.get(f"{BASE}/purchaseOrders", json=orders)
+                        tap.streams["purchase_orders"].sync()
+                    final_state = output.call_args_list[-1].args[0].value
+                    self.assertEqual(
+                        final_state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        boundary,
+                    )
+
+    def test_failed_resumed_scan_keeps_the_last_successful_boundary(self):
+        for boundary in (None, "2026-09-01"):
+            for workers in (1, 5):
+                with self.subTest(boundary=boundary, workers=workers):
+                    bookmark = {"open_order_date": boundary} if boundary else {}
+                    tap = TapUnit4(
+                        config=config(unit4_purchase_orders_request_workers=workers),
+                        state={"bookmarks": {"purchase_orders": bookmark}},
+                    )
+                    stream = tap.streams["purchase_orders"]
+                    stream.STATE_MSG_FREQUENCY = 1
+                    messages = []
+
+                    def page(request, context):
+                        if query(request)["offset"] == "1":
+                            return [self._order("PO-1"), self._order("PO-2")]
+                        context.status_code = 400
+                        return {"error": "synthetic required-page failure"}
+
+                    with requests_mock.Mocker() as m, patch(
+                        "singer.write_message",
+                        side_effect=lambda message: messages.append(deepcopy(message)),
+                    ):
+                        m.get(f"{BASE}/purchaseOrders", json=page)
+                        with self.assertRaises(FatalAPIError):
+                            stream.sync()
+                    self.assertEqual(
+                        tap.state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        boundary,
+                    )
+                    states = [message.value for message in messages if hasattr(message, "value")]
+                    self.assertEqual(len(states), 2)
+                    for state in states:
+                        self.assertEqual(
+                            state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                            boundary,
+                        )
+                    resumed = TapUnit4(config=config(), state=states[-1])
+                    with requests_mock.Mocker() as m:
+                        m.get(f"{BASE}/purchaseOrders", json=[])
+                        records(resumed.streams["purchase_orders"])
+                        params = query(m.request_history[0])
+                        self.assertEqual(params["offset"], "1")
+                        self.assertEqual(
+                            params.get("filter"),
+                            f"orderDate ge {boundary}" if boundary else None,
+                        )
+
+    def test_record_output_failure_does_not_commit_the_candidate(self):
+        boundary = "2026-09-01"
+        tap = TapUnit4(
+            config=config(page_size=100),
+            state={"bookmarks": {"purchase_orders": {"open_order_date": boundary}}},
+        )
+
+        def write(message):
+            if hasattr(message, "record") and message.record["id"] == "PO-2":
+                raise BrokenPipeError("synthetic Singer output failure")
+
+        with requests_mock.Mocker() as m, patch("singer.write_message", side_effect=write):
+            m.get(
+                f"{BASE}/purchaseOrders",
+                json=[self._order("PO-1"), self._order("PO-2")],
             )
+            with self.assertRaises(BrokenPipeError):
+                tap.streams["purchase_orders"].sync()
+        self.assertEqual(
+            tap.state["bookmarks"]["purchase_orders"]["open_order_date"], boundary
+        )
+
+    def test_partial_sync_does_not_save_a_candidate_boundary(self):
+        tap = TapUnit4(config=config())
+        stream = tap.streams["purchase_orders"]
+        stream._MAX_RECORDS_LIMIT = 1
+        stream.STATE_MSG_FREQUENCY = 1
+        with requests_mock.Mocker() as m, patch("singer.write_message"):
+            m.get(
+                f"{BASE}/purchaseOrders",
+                json=[self._order("PO-1"), self._order("PO-2")],
+            )
+            stream.sync()
+        self.assertNotIn(
+            "open_order_date", tap.state["bookmarks"]["purchase_orders"]
+        )
+
+    def test_invalid_active_markers_or_missing_status_abort_without_progress(self):
+        invalid_orders = [
+            {"id": "BAD"},
+            {**self._order("BAD"), "orderStatus": None},
+            {**self._order("BAD"), "orderStatus": ""},
+            {key: value for key, value in self._order("BAD").items() if key != "orderDate"},
+            *[
+                {**self._order("BAD"), "orderDate": value}
+                for value in (None, "", "not-a-date", "2026-09-10trailing", 123)
+            ],
+        ]
+        for invalid in invalid_orders:
+            with self.subTest(order=invalid):
+                tap = TapUnit4(config=config())
+                with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                    m.get(
+                        f"{BASE}/purchaseOrders",
+                        json=[self._order("GOOD"), invalid],
+                    )
+                    with self.assertRaises(FatalAPIError):
+                        tap.streams["purchase_orders"].sync()
+                self.assertEqual(
+                    [call.args[0].record["id"] for call in output.call_args_list
+                     if hasattr(call.args[0], "record")],
+                    ["GOOD"],
+                )
+                self.assertNotIn(
+                    "open_order_date", tap.state["bookmarks"]["purchase_orders"]
+                )
+
+    def test_sentinel_dates_emit_without_poisoning_the_boundary(self):
+        for boundary in (None, "2026-09-01"):
+            for include_normal in (False, True):
+                with self.subTest(boundary=boundary, include_normal=include_normal):
+                    bookmark = {"open_order_date": boundary} if boundary else {}
+                    tap = TapUnit4(
+                        config=config(), state={"bookmarks": {"purchase_orders": bookmark}}
+                    )
+                    orders = [{**self._order("SENTINEL"), "orderDate": "9999-12-31"}]
+                    if include_normal:
+                        orders.append(self._order("NORMAL", "B"))
+                    with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                        m.get(
+                            f"{BASE}/purchaseOrders", [{"json": orders}, {"json": []}]
+                        )
+                        tap.streams["purchase_orders"].sync()
+                    self.assertEqual(
+                        [call.args[0].record for call in output.call_args_list
+                         if hasattr(call.args[0], "record")],
+                        orders,
+                    )
+                    self.assertEqual(
+                        tap.state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        "2026-09-10" if include_normal else boundary,
+                    )
+
+    def test_invalid_saved_boundary_fails_before_requests(self):
+        for boundary in ("", "not-a-date", "2026-09-10trailing", 123, "9999-12-31"):
+            with self.subTest(boundary=boundary):
+                tap = TapUnit4(
+                    config=config(),
+                    state={"bookmarks": {"purchase_orders": {"open_order_date": boundary}}},
+                )
+                with requests_mock.Mocker() as m, patch("singer.write_message"):
+                    with self.assertRaises(FatalAPIError):
+                        tap.streams["purchase_orders"].sync()
+                    self.assertEqual(m.request_history, [])
 
     def test_legacy_tracking_does_not_trigger_detail_lookups(self):
         state = {
             "bookmarks": {
                 "purchase_orders": {
                     "source_scope": "https://old.example.com",
+                    "replication_key": "orderDate",
+                    "replication_key_value": "2035-01-01",
                     "tracked_order_ids": ["MISSING"],
                 }
             }
@@ -678,6 +920,7 @@ class PurchaseOrderFullSyncTests(unittest.TestCase):
             m.get(f"{BASE}/purchaseOrders", json=orders)
             self.assertEqual(records(stream), orders)
             self.assertEqual(m.call_count, 1)
+            self.assertNotIn("filter", query(m.request_history[0]))
 
     def test_later_page_failure_is_fatal(self):
         stream = TapUnit4(config=config()).streams["purchase_orders"]
