@@ -1,10 +1,12 @@
 """Credential-free tests for tap-unit4 (HTTP mocked with requests-mock)."""
 
 import base64
+import io
 import json
 import threading
 import unittest
 from copy import deepcopy
+from contextlib import redirect_stdout
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
@@ -33,8 +35,16 @@ def config(**overrides):
 
 
 def records(stream, context=None):
+    if stream.parent_stream_type is not None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            stream._tap.streams[stream.parent_stream_type.name].sync(context)
+        return [
+            message["record"]
+            for message in map(json.loads, output.getvalue().splitlines())
+            if message["type"] == "RECORD" and message["stream"] == stream.name
+        ]
     return list(stream.get_records(context))
-
 
 def query(request):
     return {k: v[0] for k, v in parse_qs(urlparse(request.url).query).items()}
@@ -348,11 +358,13 @@ class ProductStockTests(unittest.TestCase):
                 [
                     {
                         **self._nested_stock("P1", 7),
+                        "inactive": False,
                         "productCode": "P1",
                         "resultIndex": 0,
                     },
                     {
                         **self._nested_stock("P2", 8),
+                        "inactive": False,
                         "productCode": "P2",
                         "resultIndex": 0,
                     },
@@ -466,7 +478,7 @@ class ProductStockTests(unittest.TestCase):
                 with patch.object(
                     stream, "parse_response", side_effect=parse_response
                 ):
-                    rows = records(stream)
+                    rows = list(stream.get_records(None))
 
         self.assertEqual([row["productCode"] for row in rows], ["P1", "P2"])
         self.assertEqual(len(request_threads), 2)
@@ -502,7 +514,7 @@ class ProductStockTests(unittest.TestCase):
                     config=config(stock_batch_size=value)
                 ).streams["product_stock"]
                 with self.assertRaises(FatalAPIError):
-                    records(stream)
+                    list(stream.get_records(None))
 
     def test_single_unidentified_stock_result_uses_only_missing_identity(self):
         products = [self._product("P1"), self._product("P2")]
@@ -531,8 +543,8 @@ class ProductStockTests(unittest.TestCase):
                     self.assertEqual(
                         records(stream),
                         [
-                            {**self._stock("P1", 7), "resultIndex": 0},
-                            {**self._stock("P2", 8), "resultIndex": 0},
+                            {**self._stock("P1", 7), "inactive": False, "resultIndex": 0},
+                            {**self._stock("P2", 8), "inactive": False, "resultIndex": 0},
                         ],
                     )
 

@@ -23,6 +23,7 @@ from tap_unit4.client import Unit4Stream
 
 STATUS_CODE = re.compile(r"^[A-Za-z0-9]{1,10}$")
 MAX_PRODUCT_STOCK_REQUEST_WORKERS = 32
+MAX_PRODUCT_REQUEST_WORKERS = 10
 MAX_PURCHASE_ORDER_REQUEST_WORKERS = 10
 
 
@@ -71,16 +72,43 @@ class ProductsStream(Unit4Stream):
     path = "/products"
     primary_keys = ["productCode", "unitCode"]
     replication_key = None
+    _stock_products: deque[dict] | None = None
 
     schema = {
         "type": "object",
         "additionalProperties": True,
         "properties": {
+            "id": STRING,
+            "adminCode": STRING,
+            "countryCodeOrigin": STRING,
+            "countryCodeProvenance": STRING,
             "productCode": {"type": "string"},
             "unitCode": {"type": "string"},
             "description": STRING,
             "externalProductCode": STRING,
+            "eanCodeGenerationKey": {},
             "eanCode": STRING,
+            "eanCodeAsText": STRING,
+            "length": NUMBER,
+            "width": NUMBER,
+            "heigth": NUMBER,
+            "weight": NUMBER,
+            "productGroupCodeExternalProduct": STRING,
+            "guarantee": NUMBER,
+            "locationCode": STRING,
+            "packingUnit": STRING,
+            "packingRatio": NUMBER,
+            "referenceJournalEntryCode": STRING,
+            "searchName": STRING,
+            "searchKeys": STRING,
+            "vatGroup": STRING,
+            "warehouseCode": STRING,
+            "stockRegistration": BOOLEAN,
+            "stockKeeping": BOOLEAN,
+            "purchaseOrderRecommendation": BOOLEAN,
+            "blocked": BOOLEAN,
+            "batchRegistration": BOOLEAN,
+            "oneOff": BOOLEAN,
             "minimalPurchase": NUMBER,
             "inactive": BOOLEAN,
             "discontinued": BOOLEAN,
@@ -88,20 +116,121 @@ class ProductsStream(Unit4Stream):
             "costPrice": NUMBER,
             "minimumStock": NUMBER,
             "maximumStock": NUMBER,
+            "compositionType": STRING,
+            "storeUnit": STRING,
+            "storeRatio": NUMBER,
+            "bulkUnit": STRING,
+            "bulkRatio": NUMBER,
+            "statistics": STRING,
+            "useOfSerialNumbers": STRING,
             "productClassification": array_of(
                 obj(
                     {
+                        "id": STRING,
+                        "productIdentifier": obj(
+                            {
+                                "productCode": STRING,
+                                "externalProductCode": STRING,
+                                "productGroupCodeExternalProduct": STRING,
+                            }
+                        ),
                         "productGroupCode": STRING,
                         "productCategoryCode": STRING,
                     }
                 )
             ),
+            "printStickers": NUMBER,
+            "imagePath": STRING,
+            "abcCode": STRING,
+            "isAssembly": BOOLEAN,
+            "assemblyRecommendation": BOOLEAN,
+            "percentageLoss": NUMBER,
+            "assemblyReferenceJournalEntryCode": STRING,
+            "assemblyCosts": NUMBER,
+            "assemblyWarehouseCode": STRING,
+            "assemblyLocationCode": STRING,
+            "surplusLocationCode": STRING,
+            "numberOfUnitsPerWorkingDay": NUMBER,
+            "numberOfDaysPerUnit": NUMBER,
+            "numberOfSafetyDays": NUMBER,
+            "assemblyInstruction": STRING,
+            "assemblySubContractedWork": BOOLEAN,
+            "assemblyOnlyThroughOutsourcedWork": BOOLEAN,
+            "assemblyForecastNumber": NUMBER,
+            "usePartialRelocation": STRING,
+            "useComponentPartial": STRING,
+            "partialRelocationMinimum": NUMBER,
+            "applySubAssemblyEndProduct": BOOLEAN,
+            "applySubAssemblyComponent": BOOLEAN,
+            "subAssemblyApplicationType": STRING,
+            "alternativeUnitCode": STRING,
+            "packingRatioAlternativeUnit": NUMBER,
+            "externalStatus": STRING,
+            "stockCosts": NUMBER,
+            "stockCostPercentage": NUMBER,
+            "salesPriceBasedOnComponents": BOOLEAN,
+            "factMeasure": NUMBER,
+            "percentagePriceControl": NUMBER,
+            "propertiesToInclude": STRING,
         },
         "required": ["productCode", "unitCode"],
     }
 
     def extra_url_params(self, context) -> dict[str, t.Any]:
         return {"select": "productClassification"}
+
+    @property
+    def product_request_workers(self) -> int:
+        """Return the bounded number of concurrent catalogue page requests."""
+        workers = self.config.get("unit4_products_request_workers", 1)
+        if (
+            isinstance(workers, bool)
+            or not isinstance(workers, int)
+            or not 1 <= workers <= MAX_PRODUCT_REQUEST_WORKERS
+        ):
+            raise FatalAPIError(
+                "unit4_products_request_workers must be an integer between "
+                f"1 and {MAX_PRODUCT_REQUEST_WORKERS}."
+            )
+        return workers
+
+    def request_records(self, context) -> t.Iterable[dict]:
+        seen: set[tuple[str, str]] = set()
+        for page in self._request_pages(context, self.product_request_workers):
+            for row in page:
+                if any(row.get(key) in (None, "") for key in self.primary_keys):
+                    continue
+                identity = tuple(str(row[key]) for key in self.primary_keys)
+                if identity in seen:
+                    raise FatalAPIError(
+                        "Duplicate Unit4 product identity; "
+                        "pagination may have changed during extraction."
+                    )
+                seen.add(identity)
+            yield from page
+
+    def get_records(self, context) -> t.Iterable[dict]:
+        if not self.has_selected_descendents:
+            yield from super().get_records(context)
+            return
+        self._stock_products = deque()
+        try:
+            products = deque(super().get_records(context))
+            while products:
+                yield products.popleft()
+            super()._sync_children({})
+        finally:
+            self._stock_products.clear()
+            self._stock_products = None
+
+    def get_child_context(self, record, context) -> dict:
+        return {"product": record}
+
+    def _sync_children(self, child_context) -> None:
+        # SDK 1.0.51 calls children per accepted row; drain only after the parent iterator completes.
+        if self._stock_products is not None:
+            # SDK field selection removes keys in place before emitting the parent row.
+            self._stock_products.append(child_context["product"].copy())
 
     def post_process(self, row: dict, context=None) -> dict | None:
         """Drop rows without a stable identity instead of emitting broken keys."""
@@ -121,11 +250,7 @@ class ProductsStream(Unit4Stream):
 
 
 class ProductStockStream(Unit4Stream):
-    """Available stock per product via POST /requestProductStock.
-
-    Products are requested in configurable batches through a bounded HTTP request
-    pool so stock can run more often than the full product sync.
-    """
+    """Full product rows enriched by batched stock requests after catalogue pagination."""
 
     name = "product_stock"
     path = "/requestProductStock"
@@ -133,13 +258,15 @@ class ProductStockStream(Unit4Stream):
     paginated = False
     primary_keys = ["productCode", "unitCode", "resultIndex"]
     replication_key = None
+    parent_stream_type = ProductsStream
+    state_partitioning_keys = []
 
     schema = {
         "type": "object",
         "additionalProperties": True,
         "properties": {
-            "productCode": {"type": "string"},
-            "unitCode": {"type": "string"},
+            **ProductsStream.schema["properties"],
+            "productIdentifier": obj({"productCode": STRING}),
             "resultIndex": {"type": "integer"},
             "availableStockForSales": NUMBER,
         },
@@ -304,21 +431,18 @@ class ProductStockStream(Unit4Stream):
             yield {**result, "resultIndex": 0}
 
     def _iter_products(self) -> t.Iterable[dict]:
-        products = ProductsStream(tap=self._tap)
-        for row in products.request_records(context=None):
-            product = products.post_process(row)
-            if product is not None:
-                yield product
+        products = self._tap.streams["products"]._stock_products
+        if products is None:
+            raise FatalAPIError("product_stock must be synced through its products parent.")
+        while products:
+            yield products.popleft()
 
     def get_records(self, context) -> t.Iterable[dict]:
         skip_inactive = bool(self.config.get("stock_skip_inactive", False))
         batch_size = self.stock_batch_size
         workers = self.stock_request_workers
         products = (
-            {
-                "productCode": product["productCode"],
-                "unitCode": product["unitCode"],
-            }
+            product
             for product in self._iter_products()
             if not (skip_inactive and product.get("inactive") is True)
         )
@@ -348,7 +472,13 @@ class ProductStockStream(Unit4Stream):
                     response = future.result()
                     self.update_sync_costs(prepared_request, response, None)
                     results = list(self.parse_response(response))
-                    yield from self._validate_batch_results(batch, results)
+                    by_identity = {
+                        (product["productCode"], product["unitCode"]): product
+                        for product in batch
+                    }
+                    for result in self._validate_batch_results(batch, results):
+                        product = by_identity[(result["productCode"], result["unitCode"])]
+                        yield {**product, **result}
             finally:
                 for _, _, future in pending:
                     future.cancel()
@@ -619,63 +749,24 @@ class PurchaseOrdersStream(Unit4Stream):
         return workers
 
     def request_records(self, context) -> t.Iterable[dict]:
-        workers = self.purchase_order_request_workers
-        page_size = self.page_size
-        self._last_page_fingerprint = None
-        self._pages_fetched = 0
         seen_ids: set[str] = set()
-        decorated_request = self.request_decorator(self._request)
-        pending = deque()
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            try:
-                prepared = self.prepare_request(context, None)
-                pending.append((
-                    1, prepared, executor.submit(decorated_request, prepared, context),
-                ))
-                next_offset = 1 + page_size
-                while pending:
-                    offset, prepared, future = pending.popleft()
-                    response = future.result()
-                    self.update_sync_costs(prepared, response, context)
-                    page = list(self.parse_response(response))
-                    if len(page) > page_size:
-                        raise FatalAPIError(
-                            "Unit4 purchaseOrders returned more records than the requested limit."
-                        )
-                    continuation = self.get_next_page_token(response, offset)
-                    for record in page:
-                        value = record.get("id")
-                        if (
-                            isinstance(value, bool)
-                            or not isinstance(value, (str, int))
-                            or not str(value).strip()
-                        ):
-                            raise FatalAPIError("Unit4 purchase order has a missing or invalid id.")
-                        order_id = str(value)
-                        if order_id in seen_ids:
-                            raise FatalAPIError(
-                                f"Duplicate Unit4 purchase order {order_id!r}; "
-                                "pagination may have changed during extraction."
-                            )
-                        seen_ids.add(order_id)
-                    yield from page
-                    if continuation is None:
-                        return
-                    # Confirm the first full page before prefetching; consume futures in offset order.
-                    while (
-                        len(pending) < workers
-                        and (next_offset - 1) // page_size < self.max_pages
-                    ):
-                        prepared = self.prepare_request(context, next_offset)
-                        pending.append((
-                            next_offset, prepared,
-                            executor.submit(decorated_request, prepared, context),
-                        ))
-                        next_offset += page_size
-            finally:
-                for _, _, future in pending:
-                    future.cancel()
+        for page in self._request_pages(context, self.purchase_order_request_workers):
+            for record in page:
+                value = record.get("id")
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (str, int))
+                    or not str(value).strip()
+                ):
+                    raise FatalAPIError("Unit4 purchase order has a missing or invalid id.")
+                order_id = str(value)
+                if order_id in seen_ids:
+                    raise FatalAPIError(
+                        f"Duplicate Unit4 purchase order {order_id!r}; "
+                        "pagination may have changed during extraction."
+                    )
+                seen_ids.add(order_id)
+            yield from page
 
 
 def _parse_day(value: t.Any) -> date:

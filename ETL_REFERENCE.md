@@ -32,6 +32,14 @@ code and validates the complete identity set before emitting records. At most on
 identity may be inferred from the sole unmatched request; ambiguous responses abort. The
 probe returned `100` results for `100` products in `0.705` seconds.
 
+Products now paginate with `unit4_products_request_workers` (`1`–`10`, default `1`).
+When stock is selected, the parent finishes the catalogue once, queues accepted full
+product rows, then runs `product_stock` as a deferred batched child. The child no longer
+performs a second catalogue scan and emits product attributes alongside stock. Both
+schemas declare the 78 observed product fields; regenerate catalogs after upgrading.
+The existing ETL continues to read both streams and select only the stock columns for
+its join, so the additional child attributes do not change its mapping.
+
 ## Product eligibility and mapping
 
 ### Eligibility

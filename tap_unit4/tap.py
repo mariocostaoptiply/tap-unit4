@@ -88,6 +88,15 @@ class TapUnit4(Tap):
             ),
         ),
         th.Property(
+            "unit4_products_request_workers",
+            th.IntegerType,
+            default=1,
+            description=(
+                "Concurrent products page requests; allowed range 1-10. "
+                "Use 1 for sequential extraction."
+            ),
+        ),
+        th.Property(
             "unit4_product_stock_request_workers",
             th.IntegerType,
             default=10,

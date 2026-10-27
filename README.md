@@ -17,6 +17,7 @@ endpoints and payloads follow that export, except purchase orders use a rolling 
 | `sell_order_statuses` | no | `A,Z,O` | `salesOrders` `status` filter |
 | `stock_skip_inactive` | no | `false` | Skip stock calls for inactive products |
 | `stock_batch_size` | no | `100` | Products per `requestProductStock` call |
+| `unit4_products_request_workers` | no | `1` | Concurrent product-page requests (`1`–`10`); example config uses `4` |
 | `unit4_product_stock_request_workers` | no | `10` | Concurrent `requestProductStock` requests (`1`–`32`) |
 | `unit4_purchase_orders_request_workers` | no | `1` | Concurrent purchase-order page requests (`1`–`10`); omitted means sequential extraction |
 | `page_size` / `max_pages` / `request_timeout` | no | `100` / `10000` / `300` | |
@@ -28,7 +29,7 @@ URL: `{base_url}/{environment}/rest/api/v1/{administration}/{resource}`.
 | Stream | Endpoint | Key | Replication |
 |---|---|---|---|
 | `products` | `GET /products?select=productClassification` | `productCode`, `unitCode` | FULL_TABLE |
-| `product_stock` | `POST /requestProductStock`, up to `stock_batch_size` products per call | `productCode`, `unitCode`, `resultIndex` | FULL_TABLE |
+| `product_stock` | Stock child of `products`; `POST /requestProductStock`, up to `stock_batch_size` products per call | `productCode`, `unitCode`, `resultIndex` | FULL_TABLE; full product row plus stock |
 | `sell_orders` | `GET /salesOrders?filter=orderDate gt <day> and status in (...)&select=lines` | `id` | INCREMENTAL on `orderDate` |
 | `purchase_orders` | `GET /purchaseOrders?select=lines,supplierInfo`, plus `orderDate ge <day>` after bootstrap | `id` | FULL_TABLE transport with a custom earliest-unfinished-date bookmark |
 
@@ -48,13 +49,33 @@ See the complete [Nestinox ETL migration reference](ETL_REFERENCE.md).
 - **Retries:** 408, 429 and 5xx, 5 tries with exponential backoff; `Retry-After` honoured up to 120s.
 - **Pagination:** list endpoints use one-based `offset` values (`1`, `1 + limit`, ...); stops
   on a short, empty or 404 page. A repeated page or `max_pages` aborts the sync instead of looping.
-- **Stock:** products are optionally filtered by `stock_skip_inactive`, then requested in
-  batches of `stock_batch_size`, with at most `unit4_product_stock_request_workers` HTTP
-  requests in flight. Unit4 returns `productCode` inside `productIdentifier`; the tap
-  flattens it, then validates each response identity before emitting records. At most one
-  omitted identity can be inferred from the sole unmatched request; ambiguous responses
-  abort. Only HTTP execution runs in worker threads; parsing, validation and Singer emission
-  remain on the main thread.
+- **Products and stock:** select both streams to fetch the catalogue once. Product pages
+  use `unit4_products_request_workers`; the first page is fetched alone, then at most
+  that many pages are prefetched and consumed in offset order. Stock starts only after
+  the complete catalogue was fetched successfully and the parent rows were consumed.
+  Accepted product rows are retained in a per-run queue, not fetched again by the child.
+  This requires memory proportional to the catalogue; the queue is released on success,
+  failure or an explicitly closed partial iterator. No catalogue is cached across runs.
+  Products-only selection streams pages without retaining the complete catalogue.
+  Stock-only selection still runs product extraction, without emitting `products` rows.
+  Parent stream-map filters also exclude those products from stock requests; parent field
+  deselection does not remove data from the stock child's retained rows.
+  Stock optionally skips inactive products, then uses batches of `stock_batch_size`
+  with at most `unit4_product_stock_request_workers` HTTP requests in flight.
+  Unit4 returns `productCode` inside `productIdentifier`; the tap flattens it and joins
+  results to complete product rows by `productCode` and `unitCode`, never response position.
+  At most one omitted identity can be inferred from the sole unmatched request;
+  ambiguous, missing, duplicate or unexpected stock results abort. No zero-stock fallback.
+  `product_stock` emits the retained product attributes plus the stock response and
+  `resultIndex: 0`. Existing ETLs can still read `products` and join the stock columns.
+  Only HTTP execution runs in worker threads; parsing, validation and Singer emission
+  remain on the main thread. The deferred child hook targets SDK `1.0.51`; rerun the
+  scheduling/selection regressions when upgrading it.
+  Up to `product workers - 1` speculative GETs beyond the final page may already be in
+  flight; their records are not emitted. Duplicate product identities and oversized
+  pages abort. Offset pagination still needs stable source ordering: duplicate detection
+  cannot prove that concurrent catalogue changes skipped no unseen products.
+  Every run starts at offset `1`; failed or partial scans cannot trigger the stock phase.
 - **State:** `sell_orders` is unsorted, so the bookmark (max `orderDate`) is committed only when
   the stream completes. Each run re-reads from bookmark day minus lookback, so expect
   duplicates on `id`.
@@ -114,14 +135,20 @@ There is no public Unit4 Wholesale API spec; these remain unverified:
   rejected datetime literals. Supplied v3 samples retained `orderDate` when it
   was omitted from `select`. This tap remains on v1 and requests only
   `select=lines,supplierInfo`; no API-version migration is included.
+- product-page concurrency limits, throttling and stable catalogue ordering; local
+  loopback benchmarks demonstrate scheduling, not live Unit4 throughput or read consistency.
 
 ## Discovery and catalog fields
 
 `--discover` renders the schemas declared in `tap_unit4/streams.py`; it does not
-sample the API or infer new fields from responses. Purchase-order discovery declares
-the 26 observed header attributes, plus nested supplier, line and delivery-line
-attributes. The response field is `orderStatus`, not `OrderStatus`; the API's
-filter-field spelling does not define the JSON response's casing.
+sample the API or infer new fields from responses. Both product schemas declare the
+78 observed product attributes, including native spelling `heigth`, plus nested
+classifications. `eanCode` retains the existing numeric-to-string normalization.
+`eanCodeGenerationKey` remains open because only a null value was observed.
+The stock child also declares `productIdentifier`, `availableStockForSales` and
+`resultIndex`. Purchase-order discovery declares the 26 observed header attributes,
+plus nested supplier, line and delivery-line attributes. The response field is
+`orderStatus`, not `OrderStatus`; filter-field spelling does not define JSON casing.
 
 The installed `hotglue_singer_sdk` 1.0.51 removes undeclared top-level attributes
 before emitting Singer records, even when `additionalProperties` is true.
@@ -143,6 +170,26 @@ uv venv -p 3.10 && uv pip install -e '.[test]'
 .venv/bin/python3 -B -m pytest -q -p no:cacheprovider tests
 .venv/bin/tap-unit4 --config config.json --discover
 ```
+
+### Testing queued product and stock extraction
+
+Regenerate the catalog so `product_stock` includes product fields, then reapply selections.
+Set `unit4_products_request_workers` to `4` to enable concurrent pages, or `1` for the
+conservative sequential default. Stock batching and its worker setting are unchanged.
+Select `products` and `product_stock` for the existing ETL; no ETL change is required.
+Selecting only `product_stock` emits enriched rows but does not supply the separate
+`products` input required by that ETL.
+
+```bash
+.venv/bin/python3 -B -m pytest -q -p no:cacheprovider tests/test_product_pipeline.py
+```
+
+These credential-free tests exercise real Singer messages with synthetic HTTP responses,
+including ordering, page failures, queue cleanup, composite identity matching and
+independent stream/field selections. Live timing requires approval for the source
+account and page budget. Do not use `--test` to validate the stock phase: a limited
+parent read does not drain the deferred child.
+
 
 ### Testing purchase-order state across syncs
 
