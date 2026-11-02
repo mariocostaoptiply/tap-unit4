@@ -145,7 +145,8 @@ sample the API or infer new fields from responses. Both product schemas declare 
 78 observed product attributes, including native spelling `heigth`, plus nested
 classifications. `eanCode` retains the existing numeric-to-string normalization.
 `eanCodeGenerationKey` remains open because only a null value was observed.
-The stock child also declares `productIdentifier`, `availableStockForSales` and
+The stock child also declares `productIdentifier`, `availableStockForSales`,
+`freeStock`, `stockOverview` (including `causeOfEvent` and `availableAtDate`), and
 `resultIndex`. Purchase-order discovery declares the 26 observed header attributes,
 plus nested supplier, line and delivery-line attributes. The response field is
 `orderStatus`, not `OrderStatus`; filter-field spelling does not define JSON casing.

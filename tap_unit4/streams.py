@@ -269,6 +269,10 @@ class ProductStockStream(Unit4Stream):
             "productIdentifier": obj({"productCode": STRING}),
             "resultIndex": {"type": "integer"},
             "availableStockForSales": NUMBER,
+            "freeStock": NUMBER,
+            "stockOverview": array_of(
+                obj({"causeOfEvent": STRING, "availableAtDate": NUMBER})
+            ),
         },
         "required": ["productCode", "unitCode", "resultIndex"],
     }

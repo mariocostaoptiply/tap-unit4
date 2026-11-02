@@ -321,6 +321,38 @@ class DeferredStockTests(unittest.TestCase):
         self.assertEqual(len(schemas), 1)
         self.assertIsNone(tap.streams["products"]._stock_products)
 
+    def test_stock_balance_and_overview_survive_catalog_field_selection(self):
+        cases = (
+            (4.5, [{"causeOfEvent": "Totalen voorraad", "availableAtDate": 7.5}]),
+            (0, [{"causeOfEvent": "Totalen voorraad", "availableAtDate": 0}]),
+            (-2.5, []),
+            (None, None),
+        )
+        for free_stock, overview in cases:
+            with self.subTest(free_stock=free_stock), requests_mock.Mocker() as mock:
+                tap = pipeline_tap(selected=("product_stock",))
+                catalog = next(
+                    entry for entry in tap.catalog_dict["streams"]
+                    if entry["tap_stream_id"] == "product_stock"
+                )
+                self.assertIn("freeStock", catalog["schema"]["properties"])
+                self.assertIn("stockOverview", catalog["schema"]["properties"])
+                mock.get(
+                    f"{BASE}/products",
+                    json=lambda request, _context: [product(0)] if offset(request) == 1 else [],
+                )
+                mock.post(f"{BASE}/requestProductStock", json={"resultData": [{
+                    "productIdentifier": {"productCode": "P0"},
+                    "unitCode": "ST",
+                    "availableStockForSales": 12,
+                    "freeStock": free_stock,
+                    "stockOverview": overview,
+                }]})
+                records = emitted(sync(tap), "product_stock")
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["freeStock"], free_stock)
+                self.assertEqual(records[0]["stockOverview"], overview)
+
     def test_stream_and_field_selections_do_not_strip_queued_product_data(self):
         for selected in (("products",), ("product_stock",), ("products", "product_stock")):
             with self.subTest(selected=selected), requests_mock.Mocker() as mock:
