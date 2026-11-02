@@ -1,9 +1,12 @@
 """Credential-free tests for tap-unit4 (HTTP mocked with requests-mock)."""
 
 import base64
+import io
 import json
 import threading
 import unittest
+from copy import deepcopy
+from contextlib import redirect_stdout
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
@@ -32,8 +35,16 @@ def config(**overrides):
 
 
 def records(stream, context=None):
+    if stream.parent_stream_type is not None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            stream._tap.streams[stream.parent_stream_type.name].sync(context)
+        return [
+            message["record"]
+            for message in map(json.loads, output.getvalue().splitlines())
+            if message["type"] == "RECORD" and message["stream"] == stream.name
+        ]
     return list(stream.get_records(context))
-
 
 def query(request):
     return {k: v[0] for k, v in parse_qs(urlparse(request.url).query).items()}
@@ -53,6 +64,40 @@ class DiscoveryTests(unittest.TestCase):
         json.dumps(catalog)
         self.assertEqual(len(catalog["streams"]), 4)
 
+    def test_purchase_order_catalog_exposes_native_attributes(self):
+        catalog = TapUnit4(config=config()).catalog_dict
+        purchase_orders = next(
+            stream for stream in catalog["streams"]
+            if stream["tap_stream_id"] == "purchase_orders"
+        )
+        expected_fields = set("""
+            id adminCode orderCode automaticDiscountCalculation branchCode
+            currencyCode contactPersonCode deliveryConditionCode
+            deliveryConditionDescription discountAmount discountPercentage lines
+            orderConfirmationText textLinesAtAnOrder purchaseOrderInstructionsText
+            orderDate orderStatus orderStatusDescription orderType
+            paymentConditionCode reference supplierCode supplierInfo warehouseCode
+            canCollect propertiesToInclude
+        """.split())
+        properties = purchase_orders["schema"]["properties"]
+        self.assertEqual(set(properties), expected_fields)
+        metadata_fields = {
+            item["breadcrumb"][1]
+            for item in purchase_orders["metadata"]
+            if len(item["breadcrumb"]) == 2 and item["breadcrumb"][0] == "properties"
+        }
+        self.assertEqual(metadata_fields, expected_fields)
+        line_properties = properties["lines"]["items"]["properties"]
+        self.assertTrue({
+            "id", "productIdentifier", "unitCode", "quantityOrdered",
+            "quantityDelivered", "price", "deliveryAfter", "deliveryBefore",
+            "deliveryLines", "statusCode",
+        }.issubset(line_properties))
+        self.assertEqual(
+            set(properties["supplierInfo"]["properties"]),
+            {"id", "organisationInfo"},
+        )
+
     def test_password_is_secret(self):
         from hotglue_singer_sdk.helpers._secrets import is_common_secret_key
 
@@ -65,13 +110,15 @@ class AuthAndErrorTests(unittest.TestCase):
 
     def test_basic_auth_header_and_url(self):
         with requests_mock.Mocker() as m:
-            m.get(f"{BASE}/purchaseOrders", json=[{"id": 1}])
-            self.assertEqual(records(self.stream), [{"id": 1}])
+            order = {"id": 1, "orderStatus": "Z"}
+            m.get(f"{BASE}/purchaseOrders", json=[order])
+            self.assertEqual(records(self.stream), [order])
             sent = m.request_history[0]
             expected = base64.b64encode(b"user:secret").decode()
             self.assertEqual(sent.headers["Authorization"], f"Basic {expected}")
-            self.assertIn("filter=OrderStatus%20in%20('O','B')", sent.url)
-            self.assertEqual(query(sent)["select"], "lines,supplierInfo")
+            self.assertEqual(
+                query(sent), {"limit": "2", "offset": "1", "select": "lines,supplierInfo"}
+            )
 
     def test_401_is_invalid_credentials_without_retry(self):
         with requests_mock.Mocker() as m:
@@ -136,11 +183,12 @@ class AuthAndErrorTests(unittest.TestCase):
     @patch("time.sleep", lambda *_: None)
     def test_5xx_retries_then_succeeds(self):
         with requests_mock.Mocker() as m:
+            order = {"id": 9, "orderStatus": "Z"}
             m.get(
                 f"{BASE}/purchaseOrders",
-                [{"status_code": 503}, {"json": [{"id": 9}]}],
+                [{"status_code": 503}, {"json": [order]}],
             )
-            self.assertEqual(records(self.stream), [{"id": 9}])
+            self.assertEqual(records(self.stream), [order])
             self.assertEqual(m.call_count, 2)
 
     @patch("time.sleep", lambda *_: None)
@@ -310,11 +358,13 @@ class ProductStockTests(unittest.TestCase):
                 [
                     {
                         **self._nested_stock("P1", 7),
+                        "inactive": False,
                         "productCode": "P1",
                         "resultIndex": 0,
                     },
                     {
                         **self._nested_stock("P2", 8),
+                        "inactive": False,
                         "productCode": "P2",
                         "resultIndex": 0,
                     },
@@ -428,7 +478,7 @@ class ProductStockTests(unittest.TestCase):
                 with patch.object(
                     stream, "parse_response", side_effect=parse_response
                 ):
-                    rows = records(stream)
+                    rows = list(stream.get_records(None))
 
         self.assertEqual([row["productCode"] for row in rows], ["P1", "P2"])
         self.assertEqual(len(request_threads), 2)
@@ -464,7 +514,7 @@ class ProductStockTests(unittest.TestCase):
                     config=config(stock_batch_size=value)
                 ).streams["product_stock"]
                 with self.assertRaises(FatalAPIError):
-                    records(stream)
+                    list(stream.get_records(None))
 
     def test_single_unidentified_stock_result_uses_only_missing_identity(self):
         products = [self._product("P1"), self._product("P2")]
@@ -493,8 +543,8 @@ class ProductStockTests(unittest.TestCase):
                     self.assertEqual(
                         records(stream),
                         [
-                            {**self._stock("P1", 7), "resultIndex": 0},
-                            {**self._stock("P2", 8), "resultIndex": 0},
+                            {**self._stock("P1", 7), "inactive": False, "resultIndex": 0},
+                            {**self._stock("P2", 8), "inactive": False, "resultIndex": 0},
                         ],
                     )
 
@@ -587,6 +637,517 @@ class ProductStockTests(unittest.TestCase):
             )
             with self.assertRaises(FatalAPIError):
                 records(stream)
+
+
+class PurchaseOrderSyncTests(unittest.TestCase):
+    @staticmethod
+    def _order(order_id="PO-1", status="O", delivered=2):
+        return {
+            "id": order_id,
+            "orderDate": "2026-09-10T00:00:00",
+            "orderStatus": status,
+            "supplierInfo": {"id": "S1"},
+            "lines": [
+                {
+                    "id": f"{order_id},1",
+                    "statusCode": "Z",
+                    "productIdentifier": {"productCode": "P1"},
+                    "unitCode": "ST",
+                    "quantity": 10,
+                    "quantityDelivered": delivered,
+                }
+            ],
+        }
+
+    def test_all_statuses_are_emitted_across_unfiltered_pages(self):
+        orders = [
+            self._order("PO-1", "O"),
+            self._order("PO-2", "B"),
+            self._order("PO-3", "T"),
+            self._order("PO-4", "Z"),
+            self._order(37, "X"),
+        ]
+        stream = TapUnit4(config=config()).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
+            m.get(
+                f"{BASE}/purchaseOrders",
+                [{"json": orders[:2]}, {"json": orders[2:4]}, {"json": orders[4:]}],
+            )
+            self.assertEqual(records(stream), orders)
+            self.assertEqual(
+                [query(request) for request in m.request_history],
+                [
+                    {"limit": "2", "offset": str(offset), "select": "lines,supplierInfo"}
+                    for offset in (1, 3, 5)
+                ],
+            )
+
+    def test_completed_orders_emit_before_the_boundary_advances(self):
+        orders = [
+            {**self._order("HISTORY", "Z"), "orderDate": "2026-09-01"},
+            {**self._order("NEWER", "B"), "orderDate": "2026-09-12"},
+            {**self._order("OLDEST", "O"), "orderDate": "2026-09-10"},
+            {**self._order("TIED", "B"), "orderDate": "2026-09-10T18:00:00"},
+            {**self._order("RECENT-CLOSED", "Z"), "orderDate": "2026-09-30"},
+        ]
+        state = {}
+        previous_boundary = None
+        for completed_ids, expected_boundary in (
+            ((), "2026-09-10"),
+            (("OLDEST",), "2026-09-10"),
+            (("OLDEST", "TIED"), "2026-09-12"),
+            (("OLDEST", "TIED", "NEWER"), "2026-09-12"),
+        ):
+            with self.subTest(completed=completed_ids):
+                source = [
+                    {**row, "orderStatus": "Z"} if row["id"] in completed_ids else row
+                    for row in orders
+                    if previous_boundary is None or row["orderDate"] >= previous_boundary
+                ]
+                tap = TapUnit4(
+                    config=config(unit4_purchase_orders_request_workers=5), state=state
+                )
+                stream = tap.streams["purchase_orders"]
+                stream.STATE_MSG_FREQUENCY = 1
+                messages = []
+
+                def page(request, _context):
+                    offset = int(query(request)["offset"]) - 1
+                    return source[offset:offset + 2]
+
+                with requests_mock.Mocker() as m, patch(
+                    "singer.write_message",
+                    side_effect=lambda message: messages.append(deepcopy(message)),
+                ):
+                    m.get(f"{BASE}/purchaseOrders", json=page)
+                    stream.sync()
+                self.assertEqual(
+                    [message.record for message in messages if hasattr(message, "record")],
+                    source,
+                )
+                for request in m.request_history:
+                    params = query(request)
+                    self.assertEqual(
+                        params.get("filter"),
+                        f"orderDate ge {previous_boundary}" if previous_boundary else None,
+                    )
+                    self.assertEqual(params["select"], "lines,supplierInfo")
+                states = [message.value for message in messages if hasattr(message, "value")]
+                for interim in states[:-1]:
+                    self.assertEqual(
+                        interim["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        previous_boundary,
+                    )
+                state = states[-1]
+                self.assertEqual(
+                    state["bookmarks"]["purchase_orders"]["open_order_date"],
+                    expected_boundary,
+                )
+                previous_boundary = expected_boundary
+
+    def test_empty_or_completed_only_scan_preserves_the_boundary(self):
+        for boundary in (None, "2026-09-10"):
+            for orders in ([], [{"id": "CLOSED", "orderStatus": "Z"}]):
+                with self.subTest(boundary=boundary, orders=orders):
+                    state = {"bookmarks": {"purchase_orders": {}}}
+                    if boundary:
+                        state["bookmarks"]["purchase_orders"]["open_order_date"] = boundary
+                    tap = TapUnit4(config=config(), state=state)
+                    with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                        m.get(f"{BASE}/purchaseOrders", json=orders)
+                        tap.streams["purchase_orders"].sync()
+                    final_state = output.call_args_list[-1].args[0].value
+                    self.assertEqual(
+                        final_state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        boundary,
+                    )
+
+    def test_failed_resumed_scan_keeps_the_last_successful_boundary(self):
+        for boundary in (None, "2026-09-01"):
+            for workers in (1, 5):
+                with self.subTest(boundary=boundary, workers=workers):
+                    bookmark = {"open_order_date": boundary} if boundary else {}
+                    tap = TapUnit4(
+                        config=config(unit4_purchase_orders_request_workers=workers),
+                        state={"bookmarks": {"purchase_orders": bookmark}},
+                    )
+                    stream = tap.streams["purchase_orders"]
+                    stream.STATE_MSG_FREQUENCY = 1
+                    messages = []
+
+                    def page(request, context):
+                        if query(request)["offset"] == "1":
+                            return [self._order("PO-1"), self._order("PO-2")]
+                        context.status_code = 400
+                        return {"error": "synthetic required-page failure"}
+
+                    with requests_mock.Mocker() as m, patch(
+                        "singer.write_message",
+                        side_effect=lambda message: messages.append(deepcopy(message)),
+                    ):
+                        m.get(f"{BASE}/purchaseOrders", json=page)
+                        with self.assertRaises(FatalAPIError):
+                            stream.sync()
+                    self.assertEqual(
+                        tap.state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        boundary,
+                    )
+                    states = [message.value for message in messages if hasattr(message, "value")]
+                    self.assertEqual(len(states), 2)
+                    for state in states:
+                        self.assertEqual(
+                            state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                            boundary,
+                        )
+                    resumed = TapUnit4(config=config(), state=states[-1])
+                    with requests_mock.Mocker() as m:
+                        m.get(f"{BASE}/purchaseOrders", json=[])
+                        records(resumed.streams["purchase_orders"])
+                        params = query(m.request_history[0])
+                        self.assertEqual(params["offset"], "1")
+                        self.assertEqual(
+                            params.get("filter"),
+                            f"orderDate ge {boundary}" if boundary else None,
+                        )
+
+    def test_record_output_failure_does_not_commit_the_candidate(self):
+        boundary = "2026-09-01"
+        tap = TapUnit4(
+            config=config(page_size=100),
+            state={"bookmarks": {"purchase_orders": {"open_order_date": boundary}}},
+        )
+
+        def write(message):
+            if hasattr(message, "record") and message.record["id"] == "PO-2":
+                raise BrokenPipeError("synthetic Singer output failure")
+
+        with requests_mock.Mocker() as m, patch("singer.write_message", side_effect=write):
+            m.get(
+                f"{BASE}/purchaseOrders",
+                json=[self._order("PO-1"), self._order("PO-2")],
+            )
+            with self.assertRaises(BrokenPipeError):
+                tap.streams["purchase_orders"].sync()
+        self.assertEqual(
+            tap.state["bookmarks"]["purchase_orders"]["open_order_date"], boundary
+        )
+
+    def test_partial_sync_does_not_save_a_candidate_boundary(self):
+        tap = TapUnit4(config=config())
+        stream = tap.streams["purchase_orders"]
+        stream._MAX_RECORDS_LIMIT = 1
+        stream.STATE_MSG_FREQUENCY = 1
+        with requests_mock.Mocker() as m, patch("singer.write_message"):
+            m.get(
+                f"{BASE}/purchaseOrders",
+                json=[self._order("PO-1"), self._order("PO-2")],
+            )
+            stream.sync()
+        self.assertNotIn(
+            "open_order_date", tap.state["bookmarks"]["purchase_orders"]
+        )
+
+    def test_invalid_active_markers_or_missing_status_abort_without_progress(self):
+        invalid_orders = [
+            {"id": "BAD"},
+            {**self._order("BAD"), "orderStatus": None},
+            {**self._order("BAD"), "orderStatus": ""},
+            {key: value for key, value in self._order("BAD").items() if key != "orderDate"},
+            *[
+                {**self._order("BAD"), "orderDate": value}
+                for value in (None, "", "not-a-date", "2026-09-10trailing", 123)
+            ],
+        ]
+        for invalid in invalid_orders:
+            with self.subTest(order=invalid):
+                tap = TapUnit4(config=config())
+                with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                    m.get(
+                        f"{BASE}/purchaseOrders",
+                        json=[self._order("GOOD"), invalid],
+                    )
+                    with self.assertRaises(FatalAPIError):
+                        tap.streams["purchase_orders"].sync()
+                self.assertEqual(
+                    [call.args[0].record["id"] for call in output.call_args_list
+                     if hasattr(call.args[0], "record")],
+                    ["GOOD"],
+                )
+                self.assertNotIn(
+                    "open_order_date", tap.state["bookmarks"]["purchase_orders"]
+                )
+
+    def test_sentinel_dates_emit_without_poisoning_the_boundary(self):
+        for boundary in (None, "2026-09-01"):
+            for include_normal in (False, True):
+                with self.subTest(boundary=boundary, include_normal=include_normal):
+                    bookmark = {"open_order_date": boundary} if boundary else {}
+                    tap = TapUnit4(
+                        config=config(), state={"bookmarks": {"purchase_orders": bookmark}}
+                    )
+                    orders = [{**self._order("SENTINEL"), "orderDate": "9999-12-31"}]
+                    if include_normal:
+                        orders.append(self._order("NORMAL", "B"))
+                    with requests_mock.Mocker() as m, patch("singer.write_message") as output:
+                        m.get(
+                            f"{BASE}/purchaseOrders", [{"json": orders}, {"json": []}]
+                        )
+                        tap.streams["purchase_orders"].sync()
+                    self.assertEqual(
+                        [call.args[0].record for call in output.call_args_list
+                         if hasattr(call.args[0], "record")],
+                        orders,
+                    )
+                    self.assertEqual(
+                        tap.state["bookmarks"]["purchase_orders"].get("open_order_date"),
+                        "2026-09-10" if include_normal else boundary,
+                    )
+
+    def test_invalid_saved_boundary_fails_before_requests(self):
+        for boundary in ("", "not-a-date", "2026-09-10trailing", 123, "9999-12-31"):
+            with self.subTest(boundary=boundary):
+                tap = TapUnit4(
+                    config=config(),
+                    state={"bookmarks": {"purchase_orders": {"open_order_date": boundary}}},
+                )
+                with requests_mock.Mocker() as m, patch("singer.write_message"):
+                    with self.assertRaises(FatalAPIError):
+                        tap.streams["purchase_orders"].sync()
+                    self.assertEqual(m.request_history, [])
+
+    def test_legacy_tracking_does_not_trigger_detail_lookups(self):
+        state = {
+            "bookmarks": {
+                "purchase_orders": {
+                    "source_scope": "https://old.example.com",
+                    "replication_key": "orderDate",
+                    "replication_key_value": "2035-01-01",
+                    "tracked_order_ids": ["MISSING"],
+                }
+            }
+        }
+        stream = TapUnit4(config=config(), state=state).streams["purchase_orders"]
+        orders = [self._order("PO-1", "Z")]
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/purchaseOrders", json=orders)
+            self.assertEqual(records(stream), orders)
+            self.assertEqual(m.call_count, 1)
+            self.assertNotIn("filter", query(m.request_history[0]))
+
+    def test_later_page_failure_is_fatal(self):
+        stream = TapUnit4(config=config()).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
+            m.get(
+                f"{BASE}/purchaseOrders",
+                [
+                    {"json": [self._order("PO-1"), self._order("PO-2")]},
+                    {"status_code": 400},
+                ],
+            )
+            with self.assertRaises(FatalAPIError):
+                records(stream)
+            self.assertEqual(m.call_count, 2)
+
+    def test_concurrent_pages_preserve_order_and_payloads(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=10)
+        ).streams["purchase_orders"]
+        orders = [self._order(f"PO-{i}", "Z" if i % 2 else "O", i) for i in range(21)]
+        barrier = threading.Barrier(10, timeout=3)
+        later_page_done = threading.Event()
+        lock = threading.Lock()
+        active = peak = 0
+        completed = []
+        parse_threads = []
+        main_thread = threading.get_ident()
+        original_parse = stream.parse_response
+
+        def send(prepared, **_kwargs):
+            nonlocal active, peak
+            offset = int(query(prepared)["offset"])
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                if offset in range(3, 23, 2):
+                    barrier.wait()
+                if offset == 3:
+                    self.assertTrue(later_page_done.wait(timeout=3))
+                response = requests.Response()
+                response.status_code = 200
+                response._content = json.dumps(orders[offset - 1:offset + 1]).encode()
+                response.request = prepared
+                with lock:
+                    completed.append(offset)
+                if offset == 5:
+                    later_page_done.set()
+                return response
+            finally:
+                with lock:
+                    active -= 1
+
+        def parse(response):
+            parse_threads.append(threading.get_ident())
+            yield from original_parse(response)
+
+        with patch.object(stream.requests_session, "send", side_effect=send):
+            with patch.object(stream, "parse_response", side_effect=parse):
+                self.assertEqual(records(stream), orders)
+        self.assertEqual(peak, 10)
+        self.assertLess(completed.index(5), completed.index(3))
+        self.assertEqual(set(parse_threads), {main_thread})
+
+    def test_serial_and_concurrent_scans_match_at_page_boundaries(self):
+        for workers in (1, 5, 10):
+            for count in (0, 1, 2, 3, 4, 10, 11, 12, 20, 21, 22):
+                for ending in (200, 204, 404):
+                    if count == 0 and ending == 404:
+                        continue
+                    with self.subTest(workers=workers, count=count, ending=ending):
+                        orders = [self._order(f"PO-{i}") for i in range(count)]
+                        stream = TapUnit4(
+                            config=config(unit4_purchase_orders_request_workers=workers)
+                        ).streams["purchase_orders"]
+
+                        def page(request, context):
+                            offset = int(query(request)["offset"]) - 1
+                            context.status_code = 200 if offset < count else ending
+                            return orders[offset:offset + 2]
+
+                        with requests_mock.Mocker() as m:
+                            m.get(f"{BASE}/purchaseOrders", json=page)
+                            self.assertEqual(records(stream), orders)
+                            offsets = [query(request)["offset"] for request in m.request_history]
+                            self.assertEqual(len(offsets), len(set(offsets)))
+                            self.assertTrue(all("filter" not in query(r) for r in m.request_history))
+
+    @patch("time.sleep", lambda *_: None)
+    def test_concurrent_retries_do_not_repeat_or_lose_records(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=5)
+        ).streams["purchase_orders"]
+        orders = [self._order(f"PO-{i}") for i in range(7)]
+        attempts = 0
+
+        def page(request, context):
+            nonlocal attempts
+            offset = int(query(request)["offset"]) - 1
+            context.status_code = 200
+            if offset == 2:
+                attempts += 1
+                if attempts < 3:
+                    context.status_code = 429 if attempts == 1 else 503
+                    context.headers["Retry-After"] = "0"
+                    return []
+            return orders[offset:offset + 2]
+
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/purchaseOrders", json=page)
+            self.assertEqual(records(stream), orders)
+        self.assertEqual(attempts, 3)
+
+    def test_duplicate_id_aborts_before_emitting_the_bad_page(self):
+        pages = (
+            [[self._order("PO-1"), self._order("PO-1")]],
+            [[self._order("PO-1"), self._order("PO-2")], [self._order("PO-1")]],
+            [
+                [self._order("PO-1"), self._order("PO-2")],
+                [self._order("PO-3"), self._order("PO-4")],
+                [self._order("PO-1"), self._order("PO-2")],
+            ],
+            [[self._order(37), self._order("37")]],
+        )
+        for source_pages in pages:
+            with self.subTest(pages=source_pages):
+                stream = TapUnit4(
+                    config=config(unit4_purchase_orders_request_workers=5)
+                ).streams["purchase_orders"]
+                emitted = []
+
+                def page(request, _context):
+                    index = (int(query(request)["offset"]) - 1) // 2
+                    return source_pages[index] if index < len(source_pages) else []
+
+                with requests_mock.Mocker() as m:
+                    m.get(f"{BASE}/purchaseOrders", json=page)
+                    with self.assertRaises(FatalAPIError):
+                        for row in stream.get_records(None):
+                            emitted.append(row)
+                ids = [str(row["id"]) for row in emitted]
+                self.assertEqual(len(ids), len(set(ids)))
+
+    def test_concurrent_failure_replays_from_first_page(self):
+        for status in (400, 401, 403, 500):
+            with self.subTest(status=status):
+                orders = [self._order(f"PO-{i}") for i in range(5)]
+                tap = TapUnit4(config=config(unit4_purchase_orders_request_workers=5))
+                messages = []
+                stream = tap.streams["purchase_orders"]
+                stream.STATE_MSG_FREQUENCY = 1
+
+                def page(request, context):
+                    offset = int(query(request)["offset"]) - 1
+                    context.status_code = status if offset == 2 else 200
+                    return orders[offset:offset + 2]
+
+                error = InvalidCredentialsError if status == 401 else (
+                    RetriableAPIError if status == 500 else FatalAPIError
+                )
+                with requests_mock.Mocker() as m, patch("time.sleep", lambda *_: None):
+                    m.get(f"{BASE}/purchaseOrders", json=page)
+                    with patch(
+                        "singer.write_message",
+                        side_effect=lambda message: messages.append(deepcopy(message)),
+                    ):
+                        with self.assertRaises(error):
+                            stream.sync()
+                states = [message.value for message in messages if hasattr(message, "value")]
+                resumed = TapUnit4(config=config(), state=states[-1])
+                with requests_mock.Mocker() as m:
+                    m.get(
+                        f"{BASE}/purchaseOrders",
+                        json=lambda request, _context: orders[
+                            int(query(request)["offset"]) - 1:int(query(request)["offset"]) + 1
+                        ],
+                    )
+                    self.assertEqual(records(resumed.streams["purchase_orders"]), orders)
+                    self.assertEqual(query(m.request_history[0])["offset"], "1")
+
+    def test_prefetch_does_not_exceed_max_pages(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=5, max_pages=2)
+        ).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
+            m.get(
+                f"{BASE}/purchaseOrders",
+                json=lambda request, _context: [
+                    self._order(query(request)["offset"] + suffix) for suffix in ("a", "b")
+                ],
+            )
+            with self.assertRaises(FatalAPIError):
+                records(stream)
+            self.assertEqual([query(r)["offset"] for r in m.request_history], ["1", "3"])
+
+    def test_invalid_workers_fail_before_requests(self):
+        for workers in (0, 11):
+            with self.subTest(workers=workers):
+                stream = TapUnit4(
+                    config=config(unit4_purchase_orders_request_workers=workers)
+                ).streams["purchase_orders"]
+                with requests_mock.Mocker() as m:
+                    with self.assertRaises(FatalAPIError):
+                        records(stream)
+                    self.assertEqual(m.request_history, [])
+
+    def test_oversized_page_is_not_silently_overlapped(self):
+        stream = TapUnit4(
+            config=config(unit4_purchase_orders_request_workers=5)
+        ).streams["purchase_orders"]
+        with requests_mock.Mocker() as m:
+            m.get(f"{BASE}/purchaseOrders", json=[self._order(f"PO-{i}") for i in range(3)])
+            with self.assertRaises(FatalAPIError):
+                records(stream)
+            self.assertEqual(m.call_count, 1)
 
 
 class SellOrderReplicationTests(unittest.TestCase):

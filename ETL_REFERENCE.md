@@ -32,6 +32,14 @@ code and validates the complete identity set before emitting records. At most on
 identity may be inferred from the sole unmatched request; ambiguous responses abort. The
 probe returned `100` results for `100` products in `0.705` seconds.
 
+Products now paginate with `unit4_products_request_workers` (`1`–`10`, default `1`).
+When stock is selected, the parent finishes the catalogue once, queues accepted full
+product rows, then runs `product_stock` as a deferred batched child. The child no longer
+performs a second catalogue scan and emits product attributes alongside stock. Both
+schemas declare the 78 observed product fields; regenerate catalogs after upgrading.
+The existing ETL continues to read both streams and select only the stock columns for
+its join, so the additional child attributes do not change its mapping.
+
 ## Product eligibility and mapping
 
 ### Eligibility
@@ -147,6 +155,15 @@ no writer for that storage. Before implementing purchase-order ETL behavior, est
 - which order and line fields Optiply needs;
 - the target key and close/delete semantics when an order leaves statuses `O/B`;
 - who writes and reads the Unit4-line-ID → Optiply-buy-order-ID mapping.
+
+This branch reads all purchase orders in a paginated full-table scan with
+`select=lines,supplierInfo` and no status or date filter. It starts from the first
+page on every run, ignores previous tracking state and performs no per-order
+follow-up lookups. Native IDs and nested payloads are preserved.
+Buy-order completion and cumulative receipts from native line IDs and
+`quantityDelivered` remain ETL responsibilities, not tap transformations.
+For timing, run purchase-order extraction alone; do not feed a full historical
+scan into the ETL or target as part of the benchmark.
 
 ## Optiply-only maintenance flow
 

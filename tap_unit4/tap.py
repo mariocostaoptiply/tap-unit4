@@ -73,12 +73,6 @@ class TapUnit4(Tap):
             description="Comma-separated salesOrders status codes to include.",
         ),
         th.Property(
-            "purchase_order_statuses",
-            th.StringType,
-            default="O,B",
-            description="Comma-separated purchaseOrders OrderStatus codes to include.",
-        ),
-        th.Property(
             "stock_skip_inactive",
             th.BooleanType,
             default=False,
@@ -94,11 +88,29 @@ class TapUnit4(Tap):
             ),
         ),
         th.Property(
+            "unit4_products_request_workers",
+            th.IntegerType,
+            default=1,
+            description=(
+                "Concurrent products page requests; allowed range 1-10. "
+                "Use 1 for sequential extraction."
+            ),
+        ),
+        th.Property(
             "unit4_product_stock_request_workers",
             th.IntegerType,
             default=10,
             description=(
                 "Concurrent requestProductStock HTTP requests; allowed range 1-32."
+            ),
+        ),
+        th.Property(
+            "unit4_purchase_orders_request_workers",
+            th.IntegerType,
+            default=1,
+            description=(
+                "Concurrent purchaseOrders page requests; allowed range 1-10. "
+                "Use 1 for sequential extraction."
             ),
         ),
         th.Property("page_size", th.IntegerType, default=100, description="limit per page."),

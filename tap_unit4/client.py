@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import time
@@ -173,6 +175,48 @@ class Unit4Stream(RESTStream):
         self._last_page_fingerprint = None
         self._pages_fetched = 0
         yield from super().request_records(context)
+
+    def _request_pages(self, context, workers: int) -> t.Iterable[list[dict]]:
+        """Prefetch bounded offset pages; parse and consume them on the main thread."""
+        self._last_page_fingerprint = None
+        self._pages_fetched = 0
+        page_size = self.page_size
+        request = self.request_decorator(self._request)
+        pending = deque()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            try:
+                prepared = self.prepare_request(context, None)
+                pending.append((
+                    1, prepared, executor.submit(request, prepared, context),
+                ))
+                next_offset = 1 + page_size
+                while pending:
+                    offset, prepared, future = pending.popleft()
+                    response = future.result()
+                    self.update_sync_costs(prepared, response, context)
+                    page = list(self.parse_response(response))
+                    if len(page) > page_size:
+                        raise FatalAPIError(
+                            f"Unit4 {self.path} returned more records than the requested limit."
+                        )
+                    continuation = self.get_next_page_token(response, offset)
+                    yield page
+                    if continuation is None:
+                        return
+                    # Confirm the first full page before speculating; preserve offset order.
+                    while (
+                        len(pending) < workers
+                        and (next_offset - 1) // page_size < self.max_pages
+                    ):
+                        prepared = self.prepare_request(context, next_offset)
+                        pending.append((
+                            next_offset, prepared,
+                            executor.submit(request, prepared, context),
+                        ))
+                        next_offset += page_size
+            finally:
+                for _, _, future in pending:
+                    future.cancel()
 
     def get_url_params(self, context, next_page_token) -> dict[str, t.Any]:
         """Return one-based pagination params plus endpoint-specific values."""
